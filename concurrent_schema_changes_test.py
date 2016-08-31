@@ -11,6 +11,7 @@ from ccmlib.node import Node
 
 from dtest import Tester, debug
 from tools.decorators import known_failure, require, since
+from tools.misc import ImmutableMapping
 
 
 def wait(delay=2):
@@ -25,11 +26,8 @@ def wait(delay=2):
                flaky=True)
 @require(10699)
 class TestConcurrentSchemaChanges(Tester):
-
-    def __init__(self, *argv, **kwargs):
-        kwargs['cluster_options'] = {'start_rpc': 'true'}
-        super(TestConcurrentSchemaChanges, self).__init__(*argv, **kwargs)
-        self.allow_log_errors = True
+    cluster_options = ImmutableMapping({'start_rpc': 'true'})
+    allow_log_errors = True
 
     def prepare_for_changes(self, session, namespace='ns1'):
         """

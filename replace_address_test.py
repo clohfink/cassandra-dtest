@@ -8,12 +8,12 @@ from cassandra.query import SimpleStatement
 from ccmlib.node import Node
 from nose.plugins.attrib import attr
 
+from bootstrap_test import assert_bootstrap_state
 from dtest import DISABLE_VNODES, Tester, debug
-from tools.assertions import assert_not_running, assert_all
+from tools.assertions import assert_all, assert_not_running
 from tools.data import rows_to_list
 from tools.decorators import known_failure, since
-
-from bootstrap_test import assert_bootstrap_state
+from tools.misc import ImmutableMapping
 
 
 class NodeUnavailable(Exception):
@@ -22,12 +22,8 @@ class NodeUnavailable(Exception):
 
 class BaseReplaceAddressTest(Tester):
     __test__ = False
-
-    def __init__(self, *args, **kwargs):
-        kwargs['cluster_options'] = {'start_rpc': 'true'}
-        self.replacement_node = None
-        # Ignore these log patterns:
-        self.ignore_log_patterns = [
+    cluster_options = ImmutableMapping({'start_rpc': 'true'})
+    ignore_log_patterns = (
             # This one occurs when trying to send the migration to a
             # node that hasn't started yet, and when it does, it gets
             # replayed and everything is fine.
@@ -36,8 +32,7 @@ class BaseReplaceAddressTest(Tester):
             # ignore streaming error during bootstrap
             r'Streaming error occurred',
             r'failed stream session'
-        ]
-        Tester.__init__(self, *args, **kwargs)
+        )
 
     def _setup(self, n=3, opts=None, enable_byteman=False, mixed_versions=False):
         debug("Starting cluster with {} nodes.".format(n))
