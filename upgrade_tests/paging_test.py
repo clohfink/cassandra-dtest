@@ -1559,7 +1559,7 @@ class TestPagingWithDeletions(BasePagingTester, PageAssertionMixin):
                 raise TimeoutError(time.strftime("%d %b %Y %H:%M:%S", time.gmtime()) +
                                    " Unable to find: " + old_pattern + "or " + new_pattern + "in any node log within " + str(50) + "s")
             for node in nodes:
-                pattern = old_pattern if LooseVersion(node.get_cassandra_version()) < LooseVersion('3.0') else new_pattern
+                pattern = old_pattern if node.get_cassandra_version() < LooseVersion('3.0') else new_pattern
 
                 if node.grep_log(pattern, "system.log"):
                     return True

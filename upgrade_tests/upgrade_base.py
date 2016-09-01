@@ -191,7 +191,7 @@ class UpgradeTester(Tester):
         return node1.version()
 
     def get_node_versions(self):
-        return [LooseVersion(n.get_cassandra_version()) for n in self.cluster.nodelist()]
+        return [n.get_cassandra_version() for n in self.cluster.nodelist()]
 
     def node_version_above(self, version):
         return min(self.get_node_versions()) >= version
