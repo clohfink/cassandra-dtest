@@ -374,6 +374,18 @@ class TestOfflineTools(Tester):
         debug(error)
         self.assertIn('Found 0 sstables that need upgrading.', out)
 
+def get_partition(name, result):
+    for p in result:
+        if p['partition']['key'] == name:
+            return p
+        elif isinstance(p['partition']['key'], type({})):
+            for key in p['partition']['key']:
+                if key['name'] == name:
+                    return p
+    return None
+
+class TestOfflineTools(Tester):
+
     @since('3.0')
     def sstabledump_test(self):
         """
@@ -383,11 +395,11 @@ class TestOfflineTools(Tester):
         cluster.populate(1).start(wait_for_binary_proto=True)
         [node1] = cluster.nodelist()
         session = self.patient_cql_connection(node1)
+
         self.create_ks(session, 'ks', 1)
         session.execute('create table ks.cf (key int PRIMARY KEY, val int) with gc_grace_seconds=0')
         session.execute('insert into ks.cf (key, val) values (1,1)')
         node1.flush()
-        cluster.stop()
         [(out, error, rc)] = node1.run_sstabledump(keyspace='ks', column_families=['cf'])
         debug(out)
         debug(error)
@@ -408,6 +420,64 @@ class TestOfflineTools(Tester):
         self.assertEqual(len(s), 1)
         dumped_row = s[0][0]
         self.assertEqual(dumped_row, '1')
+
+        # check dumping collections
+        session.execute("""CREATE TABLE ks.collections (
+            key1 varchar,
+            value list<text>,
+            PRIMARY KEY(key1)
+        );""")
+        session.execute("UPDATE ks.collections SET value = [ 'v1', 'v2' ] WHERE key1 = 'testp';")
+        session.execute("UPDATE ks.collections SET value = [ 'v3' ] + value WHERE key1 = 'testp';")
+        node1.flush()
+        [(out, error, rc)] = node1.run_sstabledump(keyspace='ks', column_families=['collections'])
+        debug(out)
+        debug(error)
+        s = json.loads(out)
+        # remove the timestamp/uuid stuff for easier verification below
+        for cell in s[0]['rows'][0]['cells']:
+            if 'path' in cell:
+                del cell['path']
+            if 'deletion_info' in cell:
+                del cell['deletion_info']
+            if 'tstamp' in cell:
+                del cell['tstamp']
+
+        debug(s)
+        self.assertEqual(s[0]['partition'], { 'key' : [ 'testp' ], 'position' : 0})
+        self.assertEqual(s[0]['rows'][0]['type'], 'row')
+        self.assertEqual(s[0]['rows'][0]['position'], 19)
+        self.assertEqual(s[0]['rows'][0]['cells'], [
+          { "name" : "value" },  # tombstone for previous list if there was one
+          { "name" : "value", "value" : "v3"},
+          { "name" : "value", "value" : "v1"},
+          { "name" : "value", "value" : "v2"}
+        ])
+
+        # verify composite keys
+        session.execute("""CREATE TABLE ks.composites (
+            key1 varchar,
+            key2 varchar,
+            ckey1 varchar,
+            ckey2 varchar,
+            value bigint,
+            PRIMARY KEY((key1, key2), ckey1, ckey2)
+        );""")
+        session.execute("INSERT INTO ks.composites (key1, key2, ckey1, ckey2, value) VALUES('a', 'b', 'c', 'd', 1);")
+        session.execute("INSERT INTO ks.composites (key1, key2, ckey1, ckey2, value) VALUES('e', 'f', 'g', 'h', 2);")
+
+        node1.flush()
+        [(out, error, rc)] = node1.run_sstabledump(keyspace='ks', column_families=['composites'])
+        debug(out)
+        debug(error)
+        s = json.loads(out)
+        self.assertEqual(2, len(s))
+        self.assertEqual(["a","b"], get_partition(["a","b"], s)['partition']['key'])
+        self.assertEqual(["e","f"], get_partition(["e","f"], s)['partition']['key'])
+        self.assertEqual(1, len(get_partition(["a","b"], s)['rows']))
+        self.assertEqual(['c', 'd'], get_partition(["a","b"], s)['rows'][0]['clustering'])
+        self.assertEqual(['g', 'h'], get_partition(["e","f"], s)['rows'][0]['clustering'])
+        cluster.stop()
 
     def _check_stderr_error(self, error):
         acceptable = ["Max sstable size of", "Consider adding more capacity", "JNA link failure", "Class JavaLaunchHelper is implemented in both"]
