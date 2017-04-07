@@ -6,13 +6,13 @@ from thrift_bindings.v22.ttypes import (CfDef, Column, ColumnOrSuperColumn,
                                         SlicePredicate, SliceRange,
                                         SuperColumn)
 from thrift_tests import get_thrift_client
+from tools.misc import ImmutableMapping
+from tools.decorators import since
 
 
+@since('2.0', max_version='4')
 class TestSCCache(Tester):
-
-    def __init__(self, *args, **kwargs):
-        kwargs['cluster_options'] = {'start_rpc': 'true'}
-        Tester.__init__(self, *args, **kwargs)
+    cluster_options = ImmutableMapping({'start_rpc': 'true'})
 
     def sc_with_row_cache_test(self):
         """ Test for bug reported in #4190 """

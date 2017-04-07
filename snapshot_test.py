@@ -7,16 +7,17 @@ import time
 
 from cassandra.concurrent import execute_concurrent_with_args
 
-from dtest import (Tester, cleanup_cluster, create_ccm_cluster, debug,
-                   get_test_path)
-from tools.decorators import known_failure
+from dtest import (Tester, cleanup_cluster, create_ccm_cluster, create_ks,
+                   debug, get_test_path)
 from tools.files import replace_in_file, safe_mkdtemp
+from tools.hacks import advance_to_next_cl_segment
+from tools.misc import ImmutableMapping
 
 
 class SnapshotTester(Tester):
 
     def create_schema(self, session):
-        self.create_ks(session, 'ks', 1)
+        create_ks(session, 'ks', 1)
         session.execute('CREATE TABLE ks.cf ( key int PRIMARY KEY, val text);')
 
     def insert_rows(self, session, start, end):
@@ -107,10 +108,7 @@ class TestSnapshot(SnapshotTester):
 
 
 class TestArchiveCommitlog(SnapshotTester):
-
-    def __init__(self, *args, **kwargs):
-        kwargs['cluster_options'] = {'commitlog_segment_size_in_mb': 1}
-        SnapshotTester.__init__(self, *args, **kwargs)
+    cluster_options = ImmutableMapping({'commitlog_segment_size_in_mb': 1})
 
     def make_snapshot(self, node, ks, cf, name):
         debug("Making snapshot....")
@@ -146,17 +144,9 @@ class TestArchiveCommitlog(SnapshotTester):
                 debug("snapshot_dir is : " + snapshot_dir)
                 distutils.dir_util.copy_tree(snapshot_dir, os.path.join(data_dir, ks, cf_id))
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11811',
-                   flaky=False,
-                   notes='Fails on windows.')
     def test_archive_commitlog(self):
         self.run_archive_commitlog(restore_point_in_time=False)
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11811',
-                   flaky=False,
-                   notes='Fails on windows.')
     def test_archive_commitlog_with_active_commitlog(self):
         """
         Copy the active commitlogs to the archive directory before restoration
@@ -169,33 +159,18 @@ class TestArchiveCommitlog(SnapshotTester):
         """
         self.run_archive_commitlog(restore_point_in_time=False, restore_archived_commitlog=False)
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11811',
-                   flaky=False,
-                   notes='Fails on windows.')
     def test_archive_commitlog_point_in_time(self):
         """
         Test archive commit log with restore_point_in_time setting
         """
         self.run_archive_commitlog(restore_point_in_time=True)
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11811',
-                   flaky=False,
-                   notes='Fails on windows.')
     def test_archive_commitlog_point_in_time_with_active_commitlog(self):
         """
         Test archive commit log with restore_point_in_time setting
         """
         self.run_archive_commitlog(restore_point_in_time=True, archive_active_commitlogs=True)
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11811',
-                   flaky=False,
-                   notes='Fails on windows.')
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-12495',
-                   flaky=True)
     def test_archive_commitlog_point_in_time_with_active_commitlog_ln(self):
         """
         Test archive commit log with restore_point_in_time setting
@@ -224,7 +199,16 @@ class TestArchiveCommitlog(SnapshotTester):
         cluster.start()
 
         session = self.patient_cql_connection(node1)
-        self.create_ks(session, 'ks', 1)
+        create_ks(session, 'ks', 1)
+
+        # Write until we get a new CL segment. This avoids replaying
+        # initialization mutations from startup into system tables when
+        # restoring snapshots. See CASSANDRA-11811.
+        advance_to_next_cl_segment(
+            session=session,
+            commitlog_dir=os.path.join(node1.get_path(), 'commitlogs')
+        )
+
         session.execute('CREATE TABLE ks.cf ( key bigint PRIMARY KEY, val text);')
         debug("Writing first 30,000 rows...")
         self.insert_rows(session, 0, 30000)
@@ -233,6 +217,7 @@ class TestArchiveCommitlog(SnapshotTester):
 
         # Delete all commitlog backups so far:
         for f in glob.glob(tmp_commitlog + "/*"):
+            debug('Removing {}'.format(f))
             os.remove(f)
 
         snapshot_dirs = self.make_snapshot(node1, 'ks', 'cf', 'basic')
@@ -271,6 +256,9 @@ class TestArchiveCommitlog(SnapshotTester):
             # Record when the third set of inserts finished:
             insert_cutoff_times.append(time.gmtime())
 
+            # Flush so we get an accurate view of commitlogs
+            node1.flush()
+
             rows = session.execute('SELECT count(*) from ks.cf')
             # Make sure we have the same amount of rows as when we snapshotted:
             self.assertEqual(rows[0][0], 65000)
@@ -288,13 +276,12 @@ class TestArchiveCommitlog(SnapshotTester):
             cluster.flush()
             cluster.compact()
             node1.drain()
-            if archive_active_commitlogs:
-                # restart the node which causes the active commitlogs to be archived
-                node1.stop()
-                node1.start(wait_for_binary_proto=True)
 
             # Destroy the cluster
             cluster.stop()
+            debug("node1 commitlog dir contents after stopping: " + str(os.listdir(commitlog_dir)))
+            debug("tmp_commitlog contents after stopping: " + str(os.listdir(tmp_commitlog)))
+
             self.copy_logs(self.cluster, name=self.id().split(".")[0] + "_pre-restore")
             cleanup_cluster(self.cluster, self.test_path)
             self.test_path = get_test_path()
@@ -417,7 +404,7 @@ class TestArchiveCommitlog(SnapshotTester):
 
         debug("Creating initial connection")
         session = self.patient_cql_connection(node1)
-        self.create_ks(session, 'ks', 1)
+        create_ks(session, 'ks', 1)
         session.execute('CREATE TABLE ks.cf ( key bigint PRIMARY KEY, val text);')
         debug("Writing 30,000 rows...")
         self.insert_rows(session, 0, 60000)

@@ -5,21 +5,25 @@ import time
 import traceback
 from functools import partial
 from multiprocessing import Process, Queue
-from unittest import skipIf
+from unittest import skip, skipIf
 
 from cassandra import ConsistencyLevel
+from cassandra.concurrent import execute_concurrent_with_args
 from cassandra.cluster import Cluster
 from cassandra.query import SimpleStatement
-from nose.plugins.attrib import attr
-
-from dtest import Tester, debug
 # TODO add in requirements.txt
 from enum import Enum  # Remove when switching to py3
+from nose.plugins.attrib import attr
+from nose.tools import (assert_equal)
+
+from distutils.version import LooseVersion
+from dtest import Tester, debug, get_ip_from_node, create_ks
 from tools.assertions import (assert_all, assert_crc_check_chance_equal,
                               assert_invalid, assert_none, assert_one,
                               assert_unavailable)
-from tools.decorators import known_failure, require, since
+from tools.decorators import since
 from tools.misc import new_node
+from tools.jmxutils import (JolokiaAgent, make_mbean, remove_perf_disable_shared_mem)
 
 # CASSANDRA-10978. Migration wait (in seconds) to use in bootstrapping tests. Needed to handle
 # pathological case of flushing schema keyspace for multiple data directories. See CASSANDRA-6696
@@ -36,7 +40,7 @@ class TestMaterializedViews(Tester):
     @since 3.0
     """
 
-    def prepare(self, user_table=False, rf=1, options=None, nodes=3):
+    def prepare(self, user_table=False, rf=1, options=None, nodes=3, **kwargs):
         cluster = self.cluster
         cluster.populate([nodes, 0])
         if options:
@@ -44,8 +48,8 @@ class TestMaterializedViews(Tester):
         cluster.start()
         node1 = cluster.nodelist()[0]
 
-        session = self.patient_cql_connection(node1)
-        self.create_ks(session, 'ks', rf)
+        session = self.patient_cql_connection(node1, **kwargs)
+        create_ks(session, 'ks', rf)
 
         if user_table:
             session.execute(
@@ -61,6 +65,46 @@ class TestMaterializedViews(Tester):
 
         return session
 
+    def _settle_nodes(self):
+        debug("Settling all nodes")
+        stage_match = re.compile("(?P<name>\S+)\s+(?P<active>\d+)\s+(?P<pending>\d+)\s+(?P<completed>\d+)\s+(?P<blocked>\d+)\s+(?P<alltimeblocked>\d+)")
+
+        def _settled_stages(node):
+            (stdout, stderr, rc) = node.nodetool("tpstats")
+            lines = re.split("\n+", stdout)
+            for line in lines:
+                match = stage_match.match(line)
+                if match is not None:
+                    active = int(match.group('active'))
+                    pending = int(match.group('pending'))
+                    if active != 0 or pending != 0:
+                        debug("%s - pool %s still has %d active and %d pending" % (node.name, match.group("name"), active, pending))
+                        return False
+            return True
+
+        for node in self.cluster.nodelist():
+            if node.is_running():
+                node.nodetool("replaybatchlog")
+                attempts = 50  # 100 milliseconds per attempt, so 5 seconds total
+                while attempts > 0 and not _settled_stages(node):
+                    time.sleep(0.1)
+                    attempts -= 1
+
+    def _wait_for_view(self, ks, view):
+        debug("waiting for view")
+
+        def _view_build_finished(node):
+            s = self.patient_exclusive_cql_connection(node)
+            result = list(s.execute("SELECT * FROM system.views_builds_in_progress WHERE keyspace_name='%s' AND view_name='%s'" % (ks, view)))
+            return len(result) == 0
+
+        for node in self.cluster.nodelist():
+            if node.is_running():
+                attempts = 50  # 1 sec per attempt, so 50 seconds total
+                while attempts > 0 and not _view_build_finished(node):
+                    time.sleep(1)
+                    attempts -= 1
+
     def _insert_data(self, session):
         # insert data
         insert_stmt = "INSERT INTO users (username, password, gender, state, birth_year) VALUES "
@@ -68,6 +112,7 @@ class TestMaterializedViews(Tester):
         session.execute(insert_stmt + "('user2', 'ch@ngem3b', 'm', 'CA', 1971);")
         session.execute(insert_stmt + "('user3', 'ch@ngem3c', 'f', 'FL', 1978);")
         session.execute(insert_stmt + "('user4', 'ch@ngem3d', 'm', 'TX', 1974);")
+        self._settle_nodes()
 
     def _replay_batchlogs(self):
         debug("Replaying batchlog on all nodes")
@@ -144,7 +189,7 @@ class TestMaterializedViews(Tester):
     def populate_mv_after_insert_test(self):
         """Test that a view is OK when created with existing data"""
 
-        session = self.prepare()
+        session = self.prepare(consistency_level=ConsistencyLevel.QUORUM)
 
         session.execute("CREATE TABLE t (id int PRIMARY KEY, v int)")
 
@@ -154,11 +199,38 @@ class TestMaterializedViews(Tester):
         session.execute(("CREATE MATERIALIZED VIEW t_by_v AS SELECT * FROM t WHERE v IS NOT NULL "
                          "AND id IS NOT NULL PRIMARY KEY (v, id)"))
 
+        debug("wait for view to build")
+        self._wait_for_view("ks", "t_by_v")
+
         debug("wait that all batchlogs are replayed")
         self._replay_batchlogs()
 
         for i in xrange(1000):
             assert_one(session, "SELECT * FROM t_by_v WHERE v = {}".format(i), [i, i])
+
+    def populate_mv_after_insert_wide_rows_test(self):
+        """Test that a view is OK when created with existing data with wide rows"""
+
+        session = self.prepare(consistency_level=ConsistencyLevel.QUORUM)
+
+        session.execute("CREATE TABLE t (id int, v int, PRIMARY KEY (id, v))")
+
+        for i in xrange(5):
+            for j in xrange(10000):
+                session.execute("INSERT INTO t (id, v) VALUES ({}, {})".format(i, j))
+
+        session.execute(("CREATE MATERIALIZED VIEW t_by_v AS SELECT * FROM t WHERE v IS NOT NULL "
+                         "AND id IS NOT NULL PRIMARY KEY (v, id)"))
+
+        debug("wait for view to build")
+        self._wait_for_view("ks", "t_by_v")
+
+        debug("wait that all batchlogs are replayed")
+        self._replay_batchlogs()
+
+        for i in xrange(5):
+            for j in xrange(10000):
+                assert_one(session, "SELECT * FROM t_by_v WHERE id = {} AND v = {}".format(i, j), [j, i])
 
     def crc_check_chance_test(self):
         """Test that crc_check_chance parameter is properly populated after mv creation and update"""
@@ -300,14 +372,10 @@ class TestMaterializedViews(Tester):
             "Expecting {} materialized view, got {}".format(1, len(result))
         )
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-12225',
-                   flaky=True)
     def clustering_column_test(self):
         """Test that we can use clustering columns as primary key for a materialized view"""
 
-        session = self.prepare()
-        session.default_consistency_level = ConsistencyLevel.QUORUM
+        session = self.prepare(consistency_level=ConsistencyLevel.QUORUM)
 
         session.execute(("CREATE TABLE users (username varchar, password varchar, gender varchar, "
                          "session_token varchar, state varchar, birth_year bigint, "
@@ -376,9 +444,6 @@ class TestMaterializedViews(Tester):
         for i in xrange(1000, 1100):
             assert_one(session, "SELECT * FROM t_by_v WHERE v = {}".format(-i), [-i, i])
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-12140',
-                   flaky=True)
     @attr('resource-intensive')
     def add_dc_after_mv_simple_replication_test(self):
         """
@@ -389,9 +454,6 @@ class TestMaterializedViews(Tester):
 
         self._add_dc_after_mv_test(1)
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-12140',
-                   flaky=True)
     @attr('resource-intensive')
     def add_dc_after_mv_network_replication_test(self):
         """
@@ -402,12 +464,7 @@ class TestMaterializedViews(Tester):
 
         self._add_dc_after_mv_test({'dc1': 1, 'dc2': 1})
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-12140',
-                   flaky=True)
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-12446',
-                   flaky=True)
+    @attr('resource-intensive')
     def add_node_after_mv_test(self):
         """
         @jira_ticket CASSANDRA-10978
@@ -432,6 +489,13 @@ class TestMaterializedViews(Tester):
 
         session2 = self.patient_exclusive_cql_connection(node4)
 
+        """
+        @jira_ticket CASSANDRA-12984
+
+        Assert that MVs are marked as build after bootstrap. Otherwise newly streamed MVs will be built again
+        """
+        assert_one(session2, "SELECT count(*) FROM system.built_views WHERE keyspace_name = 'ks' AND view_name = 't_by_v'", [1])
+
         for i in xrange(1000):
             assert_one(session2, "SELECT * FROM ks.t_by_v WHERE v = {}".format(-i), [-i, i])
 
@@ -441,9 +505,120 @@ class TestMaterializedViews(Tester):
         for i in xrange(1000, 1100):
             assert_one(session, "SELECT * FROM t_by_v WHERE v = {}".format(-i), [-i, i])
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-12140',
-                   flaky=True)
+    @attr('resource-intensive')
+    def add_node_after_wide_mv_with_range_deletions_test(self):
+        """
+        @jira_ticket CASSANDRA-11670
+
+        Test that materialized views work with wide materialized views as expected when adding a node.
+        """
+
+        session = self.prepare()
+
+        session.execute("CREATE TABLE t (id int, v int, PRIMARY KEY (id, v)) WITH compaction = { 'class': 'SizeTieredCompactionStrategy', 'enabled': 'false' }")
+        session.execute(("CREATE MATERIALIZED VIEW t_by_v AS SELECT * FROM t "
+                         "WHERE v IS NOT NULL AND id IS NOT NULL PRIMARY KEY (v, id)"))
+
+        for i in xrange(10):
+            for j in xrange(100):
+                session.execute("INSERT INTO t (id, v) VALUES ({id}, {v})".format(id=i, v=j))
+
+        self.cluster.flush()
+
+        for i in xrange(10):
+            for j in xrange(100):
+                assert_one(session, "SELECT * FROM t WHERE id = {} and v = {}".format(i, j), [i, j])
+                assert_one(session, "SELECT * FROM t_by_v WHERE id = {} and v = {}".format(i, j), [j, i])
+
+        for i in xrange(10):
+            for j in xrange(100):
+                if j % 10 == 0:
+                    session.execute("DELETE FROM t WHERE id = {} AND v >= {} and v < {}".format(i, j, j + 2))
+
+        self.cluster.flush()
+
+        for i in xrange(10):
+            for j in xrange(100):
+                if j % 10 == 0 or (j - 1) % 10 == 0:
+                    assert_none(session, "SELECT * FROM t WHERE id = {} and v = {}".format(i, j))
+                    assert_none(session, "SELECT * FROM t_by_v WHERE id = {} and v = {}".format(i, j))
+                else:
+                    assert_one(session, "SELECT * FROM t WHERE id = {} and v = {}".format(i, j), [i, j])
+                    assert_one(session, "SELECT * FROM t_by_v WHERE id = {} and v = {}".format(i, j), [j, i])
+
+        node4 = new_node(self.cluster)
+        node4.set_configuration_options(values={'max_mutation_size_in_kb': 20})  # CASSANDRA-11670
+        debug("Start join at {}".format(time.strftime("%H:%M:%S")))
+        node4.start(wait_for_binary_proto=True, jvm_args=["-Dcassandra.migration_task_wait_in_seconds={}".format(MIGRATION_WAIT)])
+
+        session2 = self.patient_exclusive_cql_connection(node4)
+
+        for i in xrange(10):
+            for j in xrange(100):
+                if j % 10 == 0 or (j - 1) % 10 == 0:
+                    assert_none(session2, "SELECT * FROM ks.t WHERE id = {} and v = {}".format(i, j))
+                    assert_none(session2, "SELECT * FROM ks.t_by_v WHERE id = {} and v = {}".format(i, j))
+                else:
+                    assert_one(session2, "SELECT * FROM ks.t WHERE id = {} and v = {}".format(i, j), [i, j])
+                    assert_one(session2, "SELECT * FROM ks.t_by_v WHERE id = {} and v = {}".format(i, j), [j, i])
+
+        for i in xrange(10):
+            for j in xrange(100, 110):
+                session.execute("INSERT INTO t (id, v) VALUES ({id}, {v})".format(id=i, v=j))
+
+        for i in xrange(10):
+            for j in xrange(110):
+                if j < 100 and (j % 10 == 0 or (j - 1) % 10 == 0):
+                    assert_none(session2, "SELECT * FROM ks.t WHERE id = {} and v = {}".format(i, j))
+                    assert_none(session2, "SELECT * FROM ks.t_by_v WHERE id = {} and v = {}".format(i, j))
+                else:
+                    assert_one(session2, "SELECT * FROM ks.t WHERE id = {} and v = {}".format(i, j), [i, j])
+                    assert_one(session2, "SELECT * FROM ks.t_by_v WHERE id = {} and v = {}".format(i, j), [j, i])
+
+    @attr('resource-intensive')
+    def add_node_after_very_wide_mv_test(self):
+        """
+        @jira_ticket CASSANDRA-11670
+
+        Test that materialized views work with very wide materialized views as expected when adding a node.
+        """
+
+        session = self.prepare()
+
+        session.execute("CREATE TABLE t (id int, v int, PRIMARY KEY (id, v))")
+        session.execute(("CREATE MATERIALIZED VIEW t_by_v AS SELECT * FROM t "
+                         "WHERE v IS NOT NULL AND id IS NOT NULL PRIMARY KEY (v, id)"))
+
+        for i in xrange(5):
+            for j in xrange(5000):
+                session.execute("INSERT INTO t (id, v) VALUES ({id}, {v})".format(id=i, v=j))
+
+        self.cluster.flush()
+
+        for i in xrange(5):
+            for j in xrange(5000):
+                assert_one(session, "SELECT * FROM t_by_v WHERE id = {} and v = {}".format(i, j), [j, i])
+
+        node4 = new_node(self.cluster)
+        node4.set_configuration_options(values={'max_mutation_size_in_kb': 20})  # CASSANDRA-11670
+        debug("Start join at {}".format(time.strftime("%H:%M:%S")))
+        node4.start(wait_for_binary_proto=True, jvm_args=["-Dcassandra.migration_task_wait_in_seconds={}".format(MIGRATION_WAIT)])
+
+        session2 = self.patient_exclusive_cql_connection(node4)
+
+        for i in xrange(5):
+            for j in xrange(5000):
+                assert_one(session2, "SELECT * FROM ks.t_by_v WHERE id = {} and v = {}".format(i, j), [j, i])
+
+        for i in xrange(5):
+            for j in xrange(5100):
+                session.execute("INSERT INTO t (id, v) VALUES ({id}, {v})".format(id=i, v=j))
+
+        for i in xrange(5):
+            for j in xrange(5100):
+                assert_one(session, "SELECT * FROM t_by_v WHERE id = {} and v = {}".format(i, j), [j, i])
+
+    @attr('resource-intensive')
     def add_write_survey_node_after_mv_test(self):
         """
         @jira_ticket CASSANDRA-10621
@@ -675,10 +850,6 @@ class TestMaterializedViews(Tester):
                 [i, i, 'a', 3.0]
             )
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11612',
-                   flaky=True,
-                   notes='flaps on Windows')
     def interrupt_build_process_test(self):
         """Test that an interupted MV build process is resumed as it should"""
 
@@ -894,6 +1065,16 @@ class TestMaterializedViews(Tester):
             )
 
     def base_replica_repair_test(self):
+        self._base_replica_repair_test()
+
+    def base_replica_repair_with_contention_test(self):
+        """
+        Test repair does not fail when there is MV lock contention
+        @jira_ticket CASSANDRA-12905
+        """
+        self._base_replica_repair_test(fail_mv_lock=True)
+
+    def _base_replica_repair_test(self, fail_mv_lock=False):
         """
         Test that a materialized view are consistent after the repair of the base replica.
         """
@@ -928,8 +1109,16 @@ class TestMaterializedViews(Tester):
         node1.stop(wait_other_notice=True)
         debug('Delete node1 data')
         node1.clear(clear_all=True)
-        debug('Restarting node1')
-        node1.start(wait_other_notice=True, wait_for_binary_proto=True)
+
+        jvm_args = []
+        if fail_mv_lock:
+            if self.cluster.version() >= LooseVersion('3.10'):  # CASSANDRA-10134
+                jvm_args = ['-Dcassandra.allow_unsafe_replace=true', '-Dcassandra.replace_address={}'.format(node1.address())]
+            jvm_args.append("-Dcassandra.test.fail_mv_locks_count=1000")
+            # this should not make Keyspace.apply throw WTE on failure to acquire lock
+            node1.set_configuration_options(values={'write_request_timeout_in_ms': 100})
+        debug('Restarting node1 with jvm_args={}'.format(jvm_args))
+        node1.start(wait_other_notice=True, wait_for_binary_proto=True, jvm_args=jvm_args)
         debug('Shutdown node2 and node3')
         node2.stop(wait_other_notice=True)
         node3.stop(wait_other_notice=True)
@@ -949,6 +1138,7 @@ class TestMaterializedViews(Tester):
         node3.start(wait_other_notice=True, wait_for_binary_proto=True)
 
         # Just repair the base replica
+        debug('Starting repair on node1')
         node1.nodetool("repair ks t")
 
         debug('Verify data with cl=ALL')
@@ -1058,9 +1248,7 @@ class TestMaterializedViews(Tester):
                 cl=ConsistencyLevel.QUORUM
             )
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-12475',
-                   flaky=True)
+    @attr('resource-intensive')
     def really_complex_repair_test(self):
         """
         Test that a materialized view are consistent after a more complex repair.
@@ -1159,8 +1347,7 @@ class TestMaterializedViews(Tester):
         cluster = self.cluster
         cluster.populate(3).start()
         node1 = cluster.nodelist()[0]
-        session = self.patient_cql_connection(node1)
-        session.default_consistency_level = ConsistencyLevel.QUORUM
+        session = self.patient_cql_connection(node1, consistency_level=ConsistencyLevel.QUORUM)
 
         debug("Creating keyspace")
         session.execute("CREATE KEYSPACE mvtest WITH replication = "
@@ -1475,10 +1662,7 @@ class TestMaterializedViewsConsistency(Tester):
         for row in data:
             self.rows[(row.a, row.b)] = row.c
 
-    @known_failure(failure_source='cassandra',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11290',
-                   flaky=True)
-    @require(11290)
+    @skip('awaiting CASSANDRA-11290')
     def single_partition_consistent_reads_after_write_test(self):
         """
         Tests consistency of multiple writes to a single partition
@@ -1557,7 +1741,7 @@ class TestMaterializedViewsConsistency(Tester):
             else:
                 end = lower + (eachProcess * (i + 1))
             q = Queue()
-            node_ip = self.get_ip_from_node(node2)
+            node_ip = get_ip_from_node(node2)
             p = Process(target=thread_session, args=(node_ip, q, start, end, self.rows, num_partitions))
             p.start()
             queues[i] = q
@@ -1573,3 +1757,74 @@ class TestMaterializedViewsConsistency(Tester):
         self._print_read_status(upper)
         sys.stdout.write("\n")
         sys.stdout.flush()
+
+
+@since('3.0')
+class TestMaterializedViewsLockcontention(Tester):
+    """
+    Test materialized views lock contention.
+    @jira_ticket CASSANDRA-12689
+    @since 3.0
+    """
+
+    def _prepare_cluster(self):
+        self.cluster.populate(1)
+        self.supports_v5_protocol = self.cluster.version() >= LooseVersion('3.10')
+        self.protocol_version = 5 if self.supports_v5_protocol else 4
+
+        self.cluster.set_configuration_options(values={
+            'concurrent_materialized_view_writes': 1,
+            'concurrent_writes': 1,
+        })
+        self.nodes = self.cluster.nodes.values()
+        for node in self.nodes:
+            remove_perf_disable_shared_mem(node)
+
+        self.cluster.start(wait_for_binary_proto=True, jvm_args=[
+            "-Dcassandra.test.fail_mv_locks_count=64"
+        ])
+
+        session = self.patient_exclusive_cql_connection(self.nodes[0], protocol_version=self.protocol_version)
+
+        keyspace = "locktest"
+        session.execute("""
+                CREATE KEYSPACE IF NOT EXISTS {}
+                WITH replication = {{ 'class': 'SimpleStrategy', 'replication_factor': '1' }}
+                """.format(keyspace))
+        session.set_keyspace(keyspace)
+
+        session.execute(
+            "CREATE TABLE IF NOT EXISTS test (int1 int, int2 int, date timestamp, PRIMARY KEY (int1, int2))")
+        session.execute("""CREATE MATERIALIZED VIEW test_sorted_mv AS
+        SELECT int1, date, int2
+        FROM test
+        WHERE int1 IS NOT NULL AND date IS NOT NULL AND int2 IS NOT NULL
+        PRIMARY KEY (int1, date, int2)
+        WITH CLUSTERING ORDER BY (date DESC, int1 DESC)""")
+
+        return session
+
+    @since('3.0')
+    def test_mutations_dontblock(self):
+        session = self._prepare_cluster()
+        records = 100
+        records2 = 100
+        params = []
+        for x in xrange(records):
+            for y in xrange(records2):
+                params.append([x, y])
+
+        execute_concurrent_with_args(
+            session,
+            session.prepare('INSERT INTO test (int1, int2, date) VALUES (?, ?, toTimestamp(now()))'),
+            params
+        )
+
+        assert_one(session, "SELECT count(*) FROM test WHERE int1 = 1", [records2])
+
+        for node in self.nodes:
+            with JolokiaAgent(node) as jmx:
+                mutationStagePending = jmx.read_attribute(
+                    make_mbean('metrics', type="ThreadPools", path='request', scope='MutationStage', name='PendingTasks'), "Value"
+                )
+                assert_equal(0, mutationStagePending, "Pending mutations: {}".format(mutationStagePending))

@@ -8,26 +8,27 @@ from cassandra.policies import FallthroughRetryPolicy
 from cassandra.query import (SimpleStatement, dict_factory,
                              named_tuple_factory, tuple_factory)
 
-from dtest import Tester, debug, run_scenarios
+from dtest import Tester, debug, run_scenarios, create_ks
 from tools.assertions import (assert_all, assert_invalid, assert_length_equal,
                               assert_one)
 from tools.data import rows_to_list
 from tools.datahelp import create_rows, flatten_into_set, parse_data_into_dicts
-from tools.decorators import known_failure, since
+from tools.decorators import since
 from tools.paging import PageAssertionMixin, PageFetcher
 
 
 class BasePagingTester(Tester):
 
-    def prepare(self):
-        supports_v5_protocol = LooseVersion(self.cluster.version()) >= LooseVersion('3.10')
+    def prepare(self, row_factory=dict_factory):
+        supports_v5_protocol = self.cluster.version() >= LooseVersion('3.10')
         protocol_version = 5 if supports_v5_protocol else None
         cluster = self.cluster
         cluster.populate(3).start(wait_for_binary_proto=True)
         node1 = cluster.nodelist()[0]
-        session = self.patient_cql_connection(node1, protocol_version=protocol_version)
-        session.row_factory = dict_factory
-        session.default_consistency_level = CL.QUORUM
+        session = self.patient_cql_connection(node1,
+                                              protocol_version=protocol_version,
+                                              consistency_level=CL.QUORUM,
+                                              row_factory=row_factory)
         return session
 
 
@@ -43,7 +44,7 @@ class TestPagingSize(BasePagingTester, PageAssertionMixin):
         No errors when a page is requested and query has no results.
         """
         session = self.prepare()
-        self.create_ks(session, 'test_paging_size', 2)
+        create_ks(session, 'test_paging_size', 2)
         session.execute("CREATE TABLE paging_test ( id int PRIMARY KEY, value text )")
 
         # run a query that has no results and make sure it's exhausted
@@ -58,7 +59,7 @@ class TestPagingSize(BasePagingTester, PageAssertionMixin):
 
     def test_with_less_results_than_page_size(self):
         session = self.prepare()
-        self.create_ks(session, 'test_paging_size', 2)
+        create_ks(session, 'test_paging_size', 2)
         session.execute("CREATE TABLE paging_test ( id int PRIMARY KEY, value text )")
 
         data = """
@@ -83,7 +84,7 @@ class TestPagingSize(BasePagingTester, PageAssertionMixin):
 
     def test_with_more_results_than_page_size(self):
         session = self.prepare()
-        self.create_ks(session, 'test_paging_size', 2)
+        create_ks(session, 'test_paging_size', 2)
         session.execute("CREATE TABLE paging_test ( id int PRIMARY KEY, value text )")
 
         data = """
@@ -115,7 +116,7 @@ class TestPagingSize(BasePagingTester, PageAssertionMixin):
 
     def test_with_equal_results_to_page_size(self):
         session = self.prepare()
-        self.create_ks(session, 'test_paging_size', 2)
+        create_ks(session, 'test_paging_size', 2)
         session.execute("CREATE TABLE paging_test ( id int PRIMARY KEY, value text )")
 
         data = """
@@ -146,7 +147,7 @@ class TestPagingSize(BasePagingTester, PageAssertionMixin):
         If the page size isn't sent then the default fetch size is used.
         """
         session = self.prepare()
-        self.create_ks(session, 'test_paging_size', 2)
+        create_ks(session, 'test_paging_size', 2)
         session.execute("CREATE TABLE paging_test ( id uuid PRIMARY KEY, value text )")
 
         def random_txt(text):
@@ -183,7 +184,7 @@ class TestPagingWithModifiers(BasePagingTester, PageAssertionMixin):
         (Spanning multiple partitions won't though, by design. See CASSANDRA-6722).
         """
         session = self.prepare()
-        self.create_ks(session, 'test_paging', 2)
+        create_ks(session, 'test_paging', 2)
         session.execute(
             """
             CREATE TABLE paging_test (
@@ -232,7 +233,7 @@ class TestPagingWithModifiers(BasePagingTester, PageAssertionMixin):
         Paging over a single partition with ordering and a reversed clustering order.
         """
         session = self.prepare()
-        self.create_ks(session, 'test_paging', 2)
+        create_ks(session, 'test_paging', 2)
         session.execute(
             """
             CREATE TABLE paging_test (
@@ -287,7 +288,7 @@ class TestPagingWithModifiers(BasePagingTester, PageAssertionMixin):
 
     def test_with_limit(self):
         session = self.prepare()
-        self.create_ks(session, 'test_paging_size', 2)
+        create_ks(session, 'test_paging_size', 2)
         session.execute("CREATE TABLE paging_test ( id int, value text, PRIMARY KEY (id, value) )")
 
         def random_txt(text):
@@ -370,7 +371,7 @@ class TestPagingWithModifiers(BasePagingTester, PageAssertionMixin):
 
     def test_with_allow_filtering(self):
         session = self.prepare()
-        self.create_ks(session, 'test_paging_size', 2)
+        create_ks(session, 'test_paging_size', 2)
         session.execute("CREATE TABLE paging_test ( id int, value text, PRIMARY KEY (id, value) )")
 
         data = """
@@ -421,7 +422,7 @@ class TestPagingData(BasePagingTester, PageAssertionMixin):
 
     def test_paging_a_single_wide_row(self):
         session = self.prepare()
-        self.create_ks(session, 'test_paging_size', 2)
+        create_ks(session, 'test_paging_size', 2)
         session.execute("CREATE TABLE paging_test ( id int, value text, PRIMARY KEY (id, value) )")
 
         def random_txt(text):
@@ -445,13 +446,9 @@ class TestPagingData(BasePagingTester, PageAssertionMixin):
 
         self.assertEqualIgnoreOrder(pf.all_data(), expected_data)
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11249',
-                   flaky=True,
-                   notes='windows')
     def test_paging_across_multi_wide_rows(self):
         session = self.prepare()
-        self.create_ks(session, 'test_paging_size', 2)
+        create_ks(session, 'test_paging_size', 2)
         session.execute("CREATE TABLE paging_test ( id int, value text, PRIMARY KEY (id, value) )")
 
         def random_txt(text):
@@ -476,13 +473,9 @@ class TestPagingData(BasePagingTester, PageAssertionMixin):
 
         self.assertEqualIgnoreOrder(pf.all_data(), expected_data)
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11253',
-                   flaky=True,
-                   notes='windows')
     def test_paging_using_secondary_indexes(self):
         session = self.prepare()
-        self.create_ks(session, 'test_paging_size', 2)
+        create_ks(session, 'test_paging_size', 2)
         session.execute("CREATE TABLE paging_test ( id int, mybool boolean, sometext text, PRIMARY KEY (id, sometext) )")
         session.execute("CREATE INDEX ON paging_test(mybool)")
 
@@ -520,7 +513,7 @@ class TestPagingData(BasePagingTester, PageAssertionMixin):
 
     def test_paging_with_in_orderby_and_two_partition_keys(self):
         session = self.prepare()
-        self.create_ks(session, 'test_paging_size', 2)
+        create_ks(session, 'test_paging_size', 2)
         session.execute("CREATE TABLE paging_test (col_1 int, col_2 int, col_3 int, PRIMARY KEY ((col_1, col_2), col_3))")
 
         assert_invalid(session, "select * from paging_test where col_1=1 and col_2 IN (1, 2) order by col_3 desc;", expected=InvalidRequest)
@@ -532,10 +525,9 @@ class TestPagingData(BasePagingTester, PageAssertionMixin):
         @jira_ticket CASSANDRA-10707
         """
 
-        session = self.prepare()
-        self.create_ks(session, 'test_paging_with_group_by', 2)
+        session = self.prepare(row_factory=tuple_factory)
+        create_ks(session, 'test_paging_with_group_by', 2)
         session.execute("CREATE TABLE test (a int, b int, c int, d int, e int, primary key (a, b, c, d))")
-        session.row_factory = tuple_factory
 
         session.execute("INSERT INTO test (a, b, c, d, e) VALUES (1, 2, 1, 3, 6)")
         session.execute("INSERT INTO test (a, b, c, d, e) VALUES (1, 2, 2, 6, 12)")
@@ -876,11 +868,9 @@ class TestPagingData(BasePagingTester, PageAssertionMixin):
         @jira_ticket CASSANDRA-10707
         """
 
-        session = self.prepare()
-        self.create_ks(session, 'group_by_with_range_name_query_paging_test', 2)
+        session = self.prepare(row_factory=tuple_factory)
+        create_ks(session, 'group_by_with_range_name_query_paging_test', 2)
         session.execute("CREATE TABLE test (a int, b int, c int, d int, primary key (a, b, c))")
-
-        session.row_factory = tuple_factory
 
         for i in xrange(1, 5):
             for j in xrange(1, 5):
@@ -954,10 +944,9 @@ class TestPagingData(BasePagingTester, PageAssertionMixin):
         """
         @jira_ticket CASSANDRA-10707
         """
-        session = self.prepare()
-        self.create_ks(session, 'test_paging_with_group_by_and_static_columns', 2)
+        session = self.prepare(row_factory=tuple_factory)
+        create_ks(session, 'test_paging_with_group_by_and_static_columns', 2)
         session.execute("CREATE TABLE test (a int, b int, c int, s int static, d int, primary key (a, b, c))")
-        session.row_factory = tuple_factory
 
         # ------------------------------------
         # Test with non static columns empty
@@ -1465,10 +1454,9 @@ class TestPagingData(BasePagingTester, PageAssertionMixin):
         @jira_ticket CASSANDRA-8502.
         """
 
-        session = self.prepare()
-        self.create_ks(session, 'test_paging_static_cols', 2)
+        session = self.prepare(row_factory=named_tuple_factory)
+        create_ks(session, 'test_paging_static_cols', 2)
         session.execute("CREATE TABLE test (a int, b int, c int, s1 int static, s2 int static, PRIMARY KEY (a, b))")
-        session.row_factory = named_tuple_factory
 
         for i in range(4):
             for j in range(4):
@@ -1668,7 +1656,7 @@ class TestPagingData(BasePagingTester, PageAssertionMixin):
     @since('2.0.6')
     def test_paging_using_secondary_indexes_with_static_cols(self):
         session = self.prepare()
-        self.create_ks(session, 'test_paging_size', 2)
+        create_ks(session, 'test_paging_size', 2)
         session.execute("CREATE TABLE paging_test ( id int, s1 int static, s2 int static, mybool boolean, sometext text, PRIMARY KEY (id, sometext) )")
         session.execute("CREATE INDEX ON paging_test(mybool)")
 
@@ -1709,10 +1697,9 @@ class TestPagingData(BasePagingTester, PageAssertionMixin):
         @jira_ticket CASSANDRA-10381.
         """
 
-        session = self.prepare()
-        self.create_ks(session, 'test_paging_static_cols', 2)
+        session = self.prepare(row_factory=named_tuple_factory)
+        create_ks(session, 'test_paging_static_cols', 2)
         session.execute("CREATE TABLE test (a int, b int, c int, s int static, PRIMARY KEY (a, b))")
-        session.row_factory = named_tuple_factory
 
         for i in range(10):
             session.execute("UPDATE test SET s = {} WHERE a = {}".format(i, i))
@@ -1724,16 +1711,41 @@ class TestPagingData(BasePagingTester, PageAssertionMixin):
         results = list(session.execute("SELECT * FROM test WHERE a IN (0, 1, 2, 3, 4)"))
         self.assertEqual([0, 1, 2, 3, 4], sorted([r.s for r in results]))
 
+    def test_select_in_clause_with_duplicate_keys(self):
+        """
+        @jira_ticket CASSANDRA-12420
+        avoid duplicated result when key is duplicated in IN clause
+        """
+
+        session = self.prepare(row_factory=named_tuple_factory)
+        create_ks(session, 'test_paging_static_cols', 2)
+        session.execute("CREATE TABLE test (a int, b int, c int, v int, PRIMARY KEY ((a, b),c))")
+
+        for i in xrange(3):
+            for j in xrange(3):
+                for k in xrange(3):
+                    session.execute("INSERT INTO test (a, b, c, v) VALUES ({}, {}, {}, {})".format(i, j, k, k))
+
+        # based on partition key's token order instead of provided order and no duplication
+        for i in xrange(6):
+            session.default_fetch_size = i
+            results = rows_to_list(session.execute("SELECT * FROM test WHERE a = 1 AND b in (2, 2, 1, 1, 1)"))
+            self.assertEqual(results, [[1, 1, 0, 0],
+                                       [1, 1, 1, 1],
+                                       [1, 1, 2, 2],
+                                       [1, 2, 0, 0],
+                                       [1, 2, 1, 1],
+                                       [1, 2, 2, 2]])
+
     @since('3.0.0')
     def test_paging_with_filtering(self):
         """
         @jira_ticket CASSANDRA-6377
         """
 
-        session = self.prepare()
-        self.create_ks(session, 'test_paging_with_filtering', 2)
+        session = self.prepare(row_factory=tuple_factory)
+        create_ks(session, 'test_paging_with_filtering', 2)
         session.execute("CREATE TABLE test (a int, b int, s int static, c int, d int, primary key (a, b))")
-        session.row_factory = tuple_factory
 
         for i in xrange(5):
             session.execute("INSERT INTO test (a, s) VALUES ({}, {})".format(i, i))
@@ -1848,10 +1860,10 @@ class TestPagingData(BasePagingTester, PageAssertionMixin):
 
     def _test_paging_with_filtering_on_counter_columns(self, session, with_compact_storage):
         if with_compact_storage:
-            self.create_ks(session, 'test_flt_counter_columns_compact_storage', 2)
+            create_ks(session, 'test_flt_counter_columns_compact_storage', 2)
             session.execute("CREATE TABLE test (a int, b int, c int, cnt counter, PRIMARY KEY (a, b, c)) WITH COMPACT STORAGE")
         else:
-            self.create_ks(session, 'test_flt_counter_columns', 2)
+            create_ks(session, 'test_flt_counter_columns', 2)
             session.execute("CREATE TABLE test (a int, b int, c int, cnt counter, PRIMARY KEY (a, b, c))")
 
         for i in xrange(5):
@@ -1907,21 +1919,18 @@ class TestPagingData(BasePagingTester, PageAssertionMixin):
         @jira_ticket CASSANDRA-11629
         """
 
-        session = self.prepare()
-        session.row_factory = tuple_factory
+        session = self.prepare(row_factory=tuple_factory)
 
         self._test_paging_with_filtering_on_counter_columns(session, False)
         self._test_paging_with_filtering_on_counter_columns(session, True)
 
     def _test_paging_with_filtering_on_clustering_columns(self, session, with_compact_storage):
         if with_compact_storage:
-            self.create_ks(session, 'test_flt_clustering_columns_compact_storage', 2)
+            create_ks(session, 'test_flt_clustering_columns_compact_storage', 2)
             session.execute("CREATE TABLE test (a int, b int, c int, d int, PRIMARY KEY (a, b, c)) WITH COMPACT STORAGE")
         else:
-            self.create_ks(session, 'test_flt_clustering_columns', 2)
+            create_ks(session, 'test_flt_clustering_columns', 2)
             session.execute("CREATE TABLE test (a int, b int, c int, d int, PRIMARY KEY (a, b, c))")
-
-        session.row_factory = tuple_factory
 
         for i in xrange(5):
             for j in xrange(10):
@@ -1993,7 +2002,7 @@ class TestPagingData(BasePagingTester, PageAssertionMixin):
         @jira_ticket CASSANDRA-11310
         """
 
-        session = self.prepare()
+        session = self.prepare(row_factory=tuple_factory)
         self._test_paging_with_filtering_on_clustering_columns(session, False)
         self._test_paging_with_filtering_on_clustering_columns(session, True)
 
@@ -2004,11 +2013,10 @@ class TestPagingData(BasePagingTester, PageAssertionMixin):
         @jira_ticket CASSANDRA-11310
         """
 
-        session = self.prepare()
-        self.create_ks(session, 'test_paging_flt_clustering_clm_contains', 2)
+        session = self.prepare(row_factory=tuple_factory)
+        create_ks(session, 'test_paging_flt_clustering_clm_contains', 2)
         session.execute("CREATE TABLE test_list (a int, b int, c frozen<list<int>>, d int, PRIMARY KEY (a, b, c))")
         session.execute("CREATE TABLE test_map (a int, b int, c frozen<map<int, int>>, d int, PRIMARY KEY (a, b, c))")
-        session.row_factory = tuple_factory
 
         for i in xrange(5):
             for j in xrange(10):
@@ -2085,10 +2093,9 @@ class TestPagingData(BasePagingTester, PageAssertionMixin):
         @jira_ticket CASSANDRA-11310
         """
 
-        session = self.prepare()
-        self.create_ks(session, 'test_paging_with_filtering_on_static_columns', 2)
+        session = self.prepare(row_factory=tuple_factory)
+        create_ks(session, 'test_paging_with_filtering_on_static_columns', 2)
         session.execute("CREATE TABLE test (a int, b int, s int static, d int, PRIMARY KEY (a, b))")
-        session.row_factory = tuple_factory
 
         for i in xrange(5):
             for j in xrange(10):
@@ -2119,6 +2126,398 @@ class TestPagingData(BasePagingTester, PageAssertionMixin):
                                                                                                                        [3, 6, 4, 7],
                                                                                                                        [3, 5, 4, 6]])
 
+    @since('3.10')
+    def test_paging_with_filtering_on_partition_key(self):
+        """
+        test allow filtering on partition key
+        @jira_ticket CASSANDRA-11031
+        """
+
+        session = self.prepare(row_factory=tuple_factory)
+        create_ks(session, 'test_paging_with_filtering_on_pk', 2)
+        session.execute("CREATE TABLE test (a int, b int, s int static, c int, d int, primary key (a, b))")
+
+        for i in xrange(5):
+            session.execute("INSERT INTO test (a, s) VALUES ({}, {})".format(i, i))
+            # Lets a row with only static values
+            if i != 2:
+                for j in xrange(4):
+                    session.execute("INSERT INTO test (a, b, c, d) VALUES ({}, {}, {}, {})".format(i, j, j, i + j))
+
+        for page_size in (2, 3, 4, 5, 7, 10):
+            session.default_fetch_size = page_size
+
+            # Range queries
+            res = rows_to_list(session.execute("SELECT * FROM test WHERE a < 5 AND c = 2 ALLOW FILTERING"))
+            self.assertEqualIgnoreOrder(res, [[0, 2, 0, 2, 2],
+                                              [1, 2, 1, 2, 3],
+                                              [3, 2, 3, 2, 5],
+                                              [4, 2, 4, 2, 6]])
+
+            res = rows_to_list(session.execute("SELECT * FROM test WHERE a > 0 AND c > 1 AND c <= 2 ALLOW FILTERING"))
+            self.assertEqualIgnoreOrder(res, [[1, 2, 1, 2, 3],
+                                              [3, 2, 3, 2, 5],
+                                              [4, 2, 4, 2, 6]])
+
+            res = rows_to_list(session.execute("SELECT * FROM test WHERE a >= 2 AND c = 2 AND d > 4 ALLOW FILTERING"))
+            self.assertEqualIgnoreOrder(res, [[3, 2, 3, 2, 5],
+                                              [4, 2, 4, 2, 6]])
+
+            res = rows_to_list(session.execute("SELECT * FROM test WHERE a >= 2 AND c = 2 AND s > 1 ALLOW FILTERING"))
+            self.assertEqualIgnoreOrder(res, [[3, 2, 3, 2, 5],
+                                              [4, 2, 4, 2, 6]])
+
+            # Range queries with LIMIT
+            res = rows_to_list(session.execute("SELECT * FROM test WHERE a <= 1 AND c = 2 LIMIT 2 ALLOW FILTERING"))
+            self.assertEqualIgnoreOrder(res, [[0, 2, 0, 2, 2],
+                                              [1, 2, 1, 2, 3]])
+
+            res = rows_to_list(session.execute("SELECT * FROM test WHERE a <= 1 AND c = 2 AND s >= 1 LIMIT 2 ALLOW FILTERING"))
+            self.assertEqual(res, [[1, 2, 1, 2, 3]])
+
+            # Range query with DISTINCT
+            res = rows_to_list(session.execute("SELECT DISTINCT a, s FROM test WHERE a >= 2 AND s >= 1 ALLOW FILTERING"))
+            self.assertEqualIgnoreOrder(res, [[2, 2],
+                                              [4, 4],
+                                              [3, 3]])
+
+            # Single partition queries
+            res = rows_to_list(session.execute("SELECT * FROM test WHERE a <= 0 AND c >= 1 ALLOW FILTERING"))
+            self.assertEqual(res, [[0, 1, 0, 1, 1],
+                                   [0, 2, 0, 2, 2],
+                                   [0, 3, 0, 3, 3]])
+
+            res = rows_to_list(session.execute("SELECT * FROM test WHERE a < 1 AND c >= 1 AND c <=2 ALLOW FILTERING"))
+            self.assertEqual(res, [[0, 1, 0, 1, 1],
+                                   [0, 2, 0, 2, 2]])
+
+            res = rows_to_list(session.execute("SELECT * FROM test WHERE a >= 0 AND c >= 1 AND d = 1 ALLOW FILTERING"))
+            self.assertEqual(res, [[0, 1, 0, 1, 1]])
+
+            res = rows_to_list(session.execute("SELECT * FROM test WHERE a >= 3 AND c >= 1 AND s > 1 ALLOW FILTERING"))
+            self.assertEqualIgnoreOrder(res, [[3, 1, 3, 1, 4],
+                                              [3, 2, 3, 2, 5],
+                                              [3, 3, 3, 3, 6],
+                                              [4, 1, 4, 1, 5],
+                                              [4, 2, 4, 2, 6],
+                                              [4, 3, 4, 3, 7]])
+
+            res = rows_to_list(session.execute("SELECT * FROM test WHERE a >= 3 AND c >= 1 AND s > 1 PER PARTITION LIMIT 2 ALLOW FILTERING"))
+            self.assertEqualIgnoreOrder(res, [[3, 1, 3, 1, 4],
+                                              [3, 2, 3, 2, 5],
+                                              [4, 1, 4, 1, 5],
+                                              [4, 2, 4, 2, 6]])
+
+            # Single partition queries with LIMIT
+            res = rows_to_list(session.execute("SELECT * FROM test WHERE a < 1 AND c >= 1 LIMIT 2 ALLOW FILTERING"))
+            self.assertEqual(res, [[0, 1, 0, 1, 1],
+                                   [0, 2, 0, 2, 2]])
+
+            res = rows_to_list(session.execute("SELECT * FROM test WHERE a >= 3 AND c >= 1 AND s > 1 LIMIT 2 ALLOW FILTERING"))
+            self.assertEqual(res, [[4, 1, 4, 1, 5],
+                                   [4, 2, 4, 2, 6]])
+
+            #  Single partition query with DISTINCT
+            res = rows_to_list(session.execute("SELECT DISTINCT a, s FROM test WHERE a > 2 AND s >= 1 ALLOW FILTERING"))
+            self.assertEqual(res, [[4, 4],
+                                   [3, 3]])
+
+            # Single partition query with ORDER BY
+            assert_invalid(session, "SELECT * FROM test WHERE a <= 0 AND c >= 1 ORDER BY b DESC ALLOW FILTERING", expected=InvalidRequest)
+
+            # Single partition query with ORDER BY and LIMIT
+            assert_invalid(session, "SELECT * FROM test WHERE a <= 0 AND c >= 1 ORDER BY b DESC LIMIT 2 ALLOW FILTERING", expected=InvalidRequest)
+
+    @since('3.10')
+    def test_paging_with_filtering_on_partition_key_with_limit(self):
+        """
+        test allow filtering on partition key
+        @jira_ticket CASSANDRA-11031
+        """
+
+        session = self.prepare(row_factory=tuple_factory)
+        create_ks(session, 'test_paging_with_filtering_on_pk_with_limit', 2)
+        session.execute("CREATE TABLE test (a int, b int, c int, s int static, d int, primary key ((a, b), c))")
+
+        for i in xrange(5):
+            session.execute("INSERT INTO test (a, b, s) VALUES ({}, {}, {})".format(i, 1, i))
+            session.execute("INSERT INTO test (a, b, s) VALUES ({}, {}, {})".format(i, 2, i + 1))
+            for j in xrange(10):
+                session.execute("INSERT INTO test (a, b, c, d) VALUES ({}, {}, {}, {})".format(i, 1, j, i + j))
+                session.execute("INSERT INTO test (a, b, c, d) VALUES ({}, {}, {}, {})".format(i, 2, j, i + j))
+
+        for page_size in (2, 3, 4, 5, 7, 10):
+            session.default_fetch_size = page_size
+
+            res = rows_to_list(session.execute("SELECT * FROM test WHERE a >=2 AND b = 2 LIMIT 4 ALLOW FILTERING"))
+            self.assertEqualIgnoreOrder(res,
+                                        [[2, 2, 0, 3, 2],
+                                         [2, 2, 1, 3, 3],
+                                         [2, 2, 2, 3, 4],
+                                         [2, 2, 3, 3, 5]])
+
+    def _test_paging_with_filtering_on_partition_key_on_counter_columns(self, session, with_compact_storage):
+        if with_compact_storage:
+            create_ks(session, 'test_flt_counter_columns_compact_storage', 2)
+            session.execute("CREATE TABLE test (a int, b int, c int, cnt counter, PRIMARY KEY (a, b, c)) WITH COMPACT STORAGE")
+        else:
+            create_ks(session, 'test_flt_counter_columns', 2)
+            session.execute("CREATE TABLE test (a int, b int, c int, cnt counter, PRIMARY KEY (a, b, c))")
+
+        for i in xrange(5):
+            for j in xrange(10):
+                session.execute("UPDATE test SET cnt = cnt + {} WHERE a={} AND b={} AND c={}".format(j + 2, i, j, j + 1))
+
+        for page_size in (2, 3, 4, 5, 7, 10, 20):
+            session.default_fetch_size = page_size
+
+            # single partition
+            res = rows_to_list(session.execute("SELECT * FROM test WHERE a > 3 AND b > 3 AND c > 3 AND cnt > 8 ALLOW FILTERING"))
+            self.assertEqual(res, [[4, 7, 8, 9],
+                                   [4, 8, 9, 10],
+                                   [4, 9, 10, 11]])
+
+            res = rows_to_list(session.execute("SELECT * FROM test WHERE a >= 4 AND b > 3 AND c > 3 AND cnt >= 8 ALLOW FILTERING"))
+            self.assertEqual(res, [[4, 6, 7, 8],
+                                   [4, 7, 8, 9],
+                                   [4, 8, 9, 10],
+                                   [4, 9, 10, 11]])
+
+            res = rows_to_list(session.execute("SELECT * FROM test WHERE a < 1 AND b > 3 AND c > 3 AND cnt >= 8 AND cnt < 10 ALLOW FILTERING"))
+            self.assertEqual(res, [[0, 6, 7, 8],
+                                   [0, 7, 8, 9]])
+
+            res = rows_to_list(session.execute("SELECT * FROM test WHERE a > 3 AND b > 3 AND c > 3 AND cnt >= 8 AND cnt <= 10 ALLOW FILTERING"))
+            self.assertEqual(res, [[4, 6, 7, 8],
+                                   [4, 7, 8, 9],
+                                   [4, 8, 9, 10]])
+
+            res = rows_to_list(session.execute("SELECT * FROM test WHERE a > 1 AND cnt = 5 ALLOW FILTERING"))
+            self.assertEqualIgnoreOrder(res, [[2, 3, 4, 5],
+                                              [3, 3, 4, 5],
+                                              [4, 3, 4, 5]])
+
+    @since('3.10')
+    def test_paging_with_filtering_on_partition_key_on_counter_columns(self):
+        """
+        test paging, when filtering on partition key on counter columns
+        @jira_ticket CASSANDRA-11031
+        """
+
+        session = self.prepare(row_factory=tuple_factory)
+
+        self._test_paging_with_filtering_on_partition_key_on_counter_columns(session, False)
+        self._test_paging_with_filtering_on_partition_key_on_counter_columns(session, True)
+
+    def _test_paging_with_filtering_on_partition_key_on_clustering_columns(self, session, with_compact_storage):
+        if with_compact_storage:
+            create_ks(session, 'test_flt_pk_clustering_columns_compact_storage', 2)
+            session.execute("CREATE TABLE test (a int, b int, c int, d int, PRIMARY KEY ((a, b), c)) WITH COMPACT STORAGE")
+        else:
+            create_ks(session, 'test_flt_pk_clustering_columns', 2)
+            session.execute("CREATE TABLE test (a int, b int, c int, d int, PRIMARY KEY ((a, b), c))")
+
+        for i in xrange(5):
+            for j in xrange(10):
+                session.execute("INSERT INTO test (a,b,c,d) VALUES ({},{},{},{})".format(i, j, j + 1, j + 2))
+
+        for page_size in (2, 3, 4, 5, 7, 10, 20):
+            session.default_fetch_size = page_size
+
+            res = rows_to_list(session.execute("SELECT * FROM test WHERE a = 4 AND b > 3 AND c > 3 ALLOW FILTERING"))
+            self.assertEqual(res, [[4, 8, 9, 10],
+                                   [4, 6, 7, 8],
+                                   [4, 7, 8, 9],
+                                   [4, 5, 6, 7],
+                                   [4, 9, 10, 11],
+                                   [4, 4, 5, 6]])
+
+            res = rows_to_list(session.execute("SELECT * FROM test WHERE a = 4 AND b > 3 AND c > 3 LIMIT 4 ALLOW FILTERING"))
+            self.assertEqual(res, [[4, 8, 9, 10],
+                                   [4, 6, 7, 8],
+                                   [4, 7, 8, 9],
+                                   [4, 5, 6, 7]])
+
+            res = rows_to_list(session.execute("SELECT * FROM test WHERE a = 4 AND b > 3 AND c > 3 ALLOW FILTERING"))
+            self.assertEqual(res, [[4, 8, 9, 10],
+                                   [4, 6, 7, 8],
+                                   [4, 7, 8, 9],
+                                   [4, 5, 6, 7],
+                                   [4, 9, 10, 11],
+                                   [4, 4, 5, 6]])
+
+            res = rows_to_list(session.execute("SELECT * FROM test WHERE a > 3 AND b > 3 AND c > 3 ALLOW FILTERING"))
+            self.assertEqual(res, [[4, 8, 9, 10],
+                                   [4, 6, 7, 8],
+                                   [4, 7, 8, 9],
+                                   [4, 5, 6, 7],
+                                   [4, 9, 10, 11],
+                                   [4, 4, 5, 6]])
+
+            res = rows_to_list(session.execute("SELECT * FROM test WHERE a < 1 AND b > 3 AND c > 3 LIMIT 4 ALLOW FILTERING"))
+            self.assertEqual(res, [[0, 6, 7, 8],
+                                   [0, 5, 6, 7],
+                                   [0, 8, 9, 10],
+                                   [0, 9, 10, 11]])
+
+            res = rows_to_list(session.execute("SELECT * FROM test WHERE a < 1 AND b < 3 AND c >= 3 ALLOW FILTERING"))
+            self.assertEqual(res, [[0, 2, 3, 4]])
+
+            res = rows_to_list(session.execute("SELECT * FROM test WHERE a > 0 AND b > 7 AND c > 9 ALLOW FILTERING"))
+            self.assertEqualIgnoreOrder(res, [[4, 9, 10, 11],
+                                              [2, 9, 10, 11],
+                                              [1, 9, 10, 11],
+                                              [3, 9, 10, 11]])
+
+            res = rows_to_list(session.execute("SELECT * FROM test WHERE a < 1 AND c > 9 ALLOW FILTERING"))
+            self.assertEqualIgnoreOrder(res, [[0, 9, 10, 11]])
+
+            res = rows_to_list(session.execute("SELECT * FROM test WHERE b > 4 AND b < 6 AND c > 3 ALLOW FILTERING"))
+            self.assertEqualIgnoreOrder(res, [[2, 5, 6, 7],
+                                              [0, 5, 6, 7],
+                                              [1, 5, 6, 7],
+                                              [3, 5, 6, 7],
+                                              [4, 5, 6, 7]])
+
+            res = rows_to_list(session.execute("SELECT * FROM test WHERE d = 5 ALLOW FILTERING"))
+            self.assertEqualIgnoreOrder(res, [[0, 3, 4, 5],
+                                              [3, 3, 4, 5],
+                                              [1, 3, 4, 5],
+                                              [2, 3, 4, 5],
+                                              [4, 3, 4, 5]])
+
+            res = rows_to_list(session.execute("SELECT * FROM test WHERE a > 0 AND b = 4 AND c >=5 ALLOW FILTERING"))
+            self.assertEqualIgnoreOrder(res, [[3, 4, 5, 6],
+                                              [2, 4, 5, 6],
+                                              [1, 4, 5, 6],
+                                              [4, 4, 5, 6]])
+
+    @since('3.10')
+    def test_paging_with_filtering_on_partition_key_on_clustering_columns(self):
+        """
+        test paging, when filtering on partition key clustering columns
+        @jira_ticket CASSANDRA-11031
+        """
+
+        session = self.prepare(row_factory=tuple_factory)
+        self._test_paging_with_filtering_on_partition_key_on_clustering_columns(session, False)
+        self._test_paging_with_filtering_on_partition_key_on_clustering_columns(session, True)
+
+    @since('3.10')
+    def test_paging_with_filtering_on_partition_key_on_clustering_columns_with_contains(self):
+        """
+        test paging, when filtering on partition key and clustering columns (frozen collections) with CONTAINS statement
+        @jira_ticket CASSANDRA-11031
+        """
+
+        session = self.prepare(row_factory=tuple_factory)
+        create_ks(session, 'test_paging_flt_pk_clustering_clm_contains', 2)
+        session.execute("CREATE TABLE test_list (a int, b int, c frozen<list<int>>, d int, PRIMARY KEY (a, b, c))")
+        session.execute("CREATE TABLE test_map (a int, b int, c frozen<map<int, int>>, d int, PRIMARY KEY (a, b, c))")
+
+        for i in xrange(5):
+            for j in xrange(10):
+                session.execute("INSERT INTO test_list (a,b,c,d) VALUES ({},{},[{}, {}],{})".format(i, j, j + 1, j + 2, j + 3, j + 4))
+                session.execute("INSERT INTO test_map (a,b,c,d) VALUES ({},{},{{ {}: {} }},{})".format(i, j, j + 1, j + 2, j + 3, j + 4))
+
+        for page_size in (2, 3, 4, 5, 7, 10, 20):
+            session.default_fetch_size = page_size
+
+            res = rows_to_list(session.execute("SELECT * FROM test_list WHERE a >= 3 AND c CONTAINS 11 ALLOW FILTERING"))
+            self.assertEqualIgnoreOrder(res, [[3, 9, [10, 11], 12],
+                                              [4, 9, [10, 11], 12]])
+
+            res = rows_to_list(session.execute("SELECT * FROM test_map WHERE a <= 4 AND c CONTAINS KEY 10 ALLOW FILTERING"))
+            self.assertEqualIgnoreOrder(res, [[0, 9, {10: 11}, 12],
+                                              [1, 9, {10: 11}, 12],
+                                              [2, 9, {10: 11}, 12],
+                                              [3, 9, {10: 11}, 12],
+                                              [4, 9, {10: 11}, 12]])
+
+            res = rows_to_list(session.execute("SELECT * FROM test_list WHERE a >= 0 AND c CONTAINS 2 AND c CONTAINS 3 ALLOW FILTERING"))
+            self.assertEqualIgnoreOrder(res, [[0, 1, [2, 3], 4],
+                                              [1, 1, [2, 3], 4],
+                                              [2, 1, [2, 3], 4],
+                                              [3, 1, [2, 3], 4],
+                                              [4, 1, [2, 3], 4]])
+
+            res = rows_to_list(session.execute("SELECT * FROM test_map WHERE a >= 3 AND c CONTAINS KEY 2 AND c CONTAINS 3 ALLOW FILTERING"))
+            self.assertEqualIgnoreOrder(res, [[3, 1, {2: 3}, 4],
+                                              [4, 1, {2: 3}, 4]])
+
+            res = rows_to_list(session.execute("SELECT * FROM test_list WHERE a < 5 AND c CONTAINS 2 AND d = 4 ALLOW FILTERING"))
+            self.assertEqualIgnoreOrder(res, [[0, 1, [2, 3], 4],
+                                              [1, 1, [2, 3], 4],
+                                              [2, 1, [2, 3], 4],
+                                              [3, 1, [2, 3], 4],
+                                              [4, 1, [2, 3], 4]])
+
+            res = rows_to_list(session.execute("SELECT * FROM test_map WHERE a > -1 AND c CONTAINS KEY 2 AND d = 4 ALLOW FILTERING"))
+            self.assertEqualIgnoreOrder(res, [[0, 1, {2: 3}, 4],
+                                              [1, 1, {2: 3}, 4],
+                                              [2, 1, {2: 3}, 4],
+                                              [3, 1, {2: 3}, 4],
+                                              [4, 1, {2: 3}, 4]])
+
+            res = rows_to_list(session.execute("SELECT * FROM test_list WHERE a < 4 AND c CONTAINS 2 AND d = 4 ALLOW FILTERING"))
+            self.assertEqualIgnoreOrder(res, [[0, 1, [2, 3], 4],
+                                              [1, 1, [2, 3], 4],
+                                              [2, 1, [2, 3], 4],
+                                              [3, 1, [2, 3], 4]])
+
+            res = rows_to_list(session.execute("SELECT * FROM test_map WHERE a >= 0 AND c CONTAINS KEY 2 AND d = 4 ALLOW FILTERING"))
+            self.assertEqualIgnoreOrder(res, [[0, 1, {2: 3}, 4],
+                                              [1, 1, {2: 3}, 4],
+                                              [2, 1, {2: 3}, 4],
+                                              [3, 1, {2: 3}, 4],
+                                              [4, 1, {2: 3}, 4]])
+
+            res = rows_to_list(session.execute("SELECT * FROM test_list WHERE a <= 2 AND c CONTAINS 2 AND d < 4 ALLOW FILTERING"))
+            self.assertEqualIgnoreOrder(res, [[0, 0, [1, 2], 3],
+                                              [1, 0, [1, 2], 3],
+                                              [2, 0, [1, 2], 3]])
+
+            res = rows_to_list(session.execute("SELECT * FROM test_map WHERE a >= -1 AND c CONTAINS KEY 1 AND d < 4 ALLOW FILTERING"))
+            self.assertEqualIgnoreOrder(res, [[0, 0, {1: 2}, 3],
+                                              [1, 0, {1: 2}, 3],
+                                              [2, 0, {1: 2}, 3],
+                                              [3, 0, {1: 2}, 3],
+                                              [4, 0, {1: 2}, 3]])
+
+    @since('3.10')
+    def test_paging_with_filtering_on_partition_key_on_static_columns(self):
+        """
+        test paging, when filtering on partition key, on static columns
+        @jira_ticket CASSANDRA-11031
+        """
+
+        session = self.prepare(row_factory=tuple_factory)
+        create_ks(session, 'test_paging_filtering_on_pk_static_columns', 2)
+        session.execute("CREATE TABLE test (a int, b int, s int static, d int, PRIMARY KEY (a, b))")
+
+        for i in xrange(5):
+            for j in xrange(10):
+                session.execute("INSERT INTO test (a,b,s,d) VALUES ({},{},{},{})".format(i, j, i + 1, j + 1))
+
+        for page_size in (2, 3, 4, 5, 7, 10, 20):
+            session.default_fetch_size = page_size
+
+            res = rows_to_list(session.execute("SELECT * FROM test WHERE a <= 2 AND s > 1 AND b > 8 ALLOW FILTERING"))
+            self.assertEqualIgnoreOrder(res, [[1, 9, 2, 10],
+                                              [2, 9, 3, 10]])
+
+            res = rows_to_list(session.execute("SELECT * FROM test WHERE a > 3 AND s > 1 AND b > 5 AND b < 7 ALLOW FILTERING"))
+            self.assertEqualIgnoreOrder(res, [[4, 6, 5, 7]])
+
+            res = rows_to_list(session.execute("SELECT * FROM test WHERE s > 1 AND a > 3 AND b > 4 ALLOW FILTERING"))
+            self.assertEqual(res, [[4, 5, 5, 6],
+                                   [4, 6, 5, 7],
+                                   [4, 7, 5, 8],
+                                   [4, 8, 5, 9],
+                                   [4, 9, 5, 10]])
+
+            assert_invalid(session, "SELECT * FROM test WHERE s > 1 AND a < 2 AND b > 4 ORDER BY b DESC ALLOW FILTERING", expected=InvalidRequest)
+
     @since('2.1.14')
     def test_paging_on_compact_table_with_tombstone_on_first_column(self):
         """
@@ -2126,10 +2525,9 @@ class TestPagingData(BasePagingTester, PageAssertionMixin):
         @jira_ticket CASSANDRA-11467
         """
 
-        session = self.prepare()
-        self.create_ks(session, 'test_paging_on_compact_table_with_tombstone', 2)
+        session = self.prepare(row_factory=tuple_factory)
+        create_ks(session, 'test_paging_on_compact_table_with_tombstone', 2)
         session.execute("CREATE TABLE test (a int primary key, b int, c int) WITH COMPACT STORAGE")
-        session.row_factory = tuple_factory
 
         for i in xrange(5):
             session.execute("INSERT INTO test (a, b, c) VALUES ({}, {}, {})".format(i, 1, 1))
@@ -2150,11 +2548,10 @@ class TestPagingData(BasePagingTester, PageAssertionMixin):
         @jira_ticket CASSANDRA-11208
         """
 
-        session = self.prepare()
-        self.create_ks(session, 'test_paging_with_no_clustering_columns', 2)
+        session = self.prepare(row_factory=tuple_factory)
+        create_ks(session, 'test_paging_with_no_clustering_columns', 2)
         session.execute("CREATE TABLE test (a int primary key, b int)")
         session.execute("CREATE TABLE test_compact (a int primary key, b int) WITH COMPACT STORAGE")
-        session.row_factory = tuple_factory
 
         for table in ('test', 'test_compact'):
 
@@ -2217,10 +2614,9 @@ class TestPagingData(BasePagingTester, PageAssertionMixin):
 
         @jira_ticket CASSANDRA-11535
         """
-        session = self.prepare()
-        self.create_ks(session, 'test_paging_with_per_partition_limit', 2)
+        session = self.prepare(row_factory=tuple_factory)
+        create_ks(session, 'test_paging_with_per_partition_limit', 2)
         session.execute("CREATE TABLE test (a int, b int, c int, PRIMARY KEY (a, b))")
-        session.row_factory = tuple_factory
 
         for i in range(5):
             for j in range(5):
@@ -2300,11 +2696,10 @@ class TestPagingData(BasePagingTester, PageAssertionMixin):
         @jira_ticket CASSANDRA-11669
         """
 
-        session = self.prepare()
-        self.create_ks(session, 'test_paging_for_range_name_queries', 2)
+        session = self.prepare(row_factory=tuple_factory)
+        create_ks(session, 'test_paging_for_range_name_queries', 2)
         session.execute("CREATE TABLE test (a int, b int, c int, d int, PRIMARY KEY(a, b, c))")
         session.execute("CREATE TABLE test_compact (a int, b int, c int, d int, PRIMARY KEY(a, b, c)) WITH COMPACT STORAGE")
-        session.row_factory = tuple_factory
 
         for table in ('test', 'test_compact'):
 
@@ -2348,6 +2743,50 @@ class TestPagingData(BasePagingTester, PageAssertionMixin):
                                                                                                                               [3, 2, 1, 5],
                                                                                                                               [3, 2, 2, 5]])
 
+    @since('2.1')
+    def test_paging_with_empty_row_and_empty_static_columns(self):
+        """
+        test paging when the rows and the static columns are empty
+        @jira_ticket CASSANDRA-13017
+        """
+
+        session = self.prepare(row_factory=tuple_factory)
+        create_ks(session, 'test_paging_with_empty_rows_and_static_columns', 2)
+        session.execute("CREATE TABLE test (pk int, c int, v int, s int static, primary key(pk, c))")
+
+        for i in xrange(5):
+            for j in xrange(5):
+                session.execute("INSERT INTO test (pk, c) VALUES ({}, {})".format(i, j))
+
+        for page_size in (2, 3, 4, 5, 7, 10):
+            session.default_fetch_size = page_size
+
+            res = rows_to_list(session.execute("SELECT DISTINCT pk FROM test"))
+            self.assertEqual(res, [[1],
+                                   [0],
+                                   [2],
+                                   [4],
+                                   [3]])
+
+            res = rows_to_list(session.execute("SELECT DISTINCT pk FROM test LIMIT 4"))
+            self.assertEqual(res, [[1],
+                                   [0],
+                                   [2],
+                                   [4]])
+
+            res = rows_to_list(session.execute("SELECT DISTINCT pk, s FROM test"))
+            self.assertEqual(res, [[1, None],
+                                   [0, None],
+                                   [2, None],
+                                   [4, None],
+                                   [3, None]])
+
+            res = rows_to_list(session.execute("SELECT DISTINCT pk, s FROM test LIMIT 4"))
+            self.assertEqual(res, [[1, None],
+                                   [0, None],
+                                   [2, None],
+                                   [4, None]])
+
 
 @since('2.0')
 class TestPagingDatasetChanges(BasePagingTester, PageAssertionMixin):
@@ -2357,7 +2796,7 @@ class TestPagingDatasetChanges(BasePagingTester, PageAssertionMixin):
 
     def test_data_change_impacting_earlier_page(self):
         session = self.prepare()
-        self.create_ks(session, 'test_paging_size', 2)
+        create_ks(session, 'test_paging_size', 2)
         session.execute("CREATE TABLE paging_test ( id int, mytext text, PRIMARY KEY (id, mytext) )")
 
         def random_txt(text):
@@ -2391,7 +2830,7 @@ class TestPagingDatasetChanges(BasePagingTester, PageAssertionMixin):
 
     def test_data_change_impacting_later_page(self):
         session = self.prepare()
-        self.create_ks(session, 'test_paging_size', 2)
+        create_ks(session, 'test_paging_size', 2)
         session.execute("CREATE TABLE paging_test ( id int, mytext text, PRIMARY KEY (id, mytext) )")
 
         def random_txt(text):
@@ -2426,7 +2865,7 @@ class TestPagingDatasetChanges(BasePagingTester, PageAssertionMixin):
 
     def test_row_TTL_expiry_during_paging(self):
         session = self.prepare()
-        self.create_ks(session, 'test_paging_size', 2)
+        create_ks(session, 'test_paging_size', 2)
         session.execute("CREATE TABLE paging_test ( id int, mytext text, PRIMARY KEY (id, mytext) )")
 
         def random_txt(text):
@@ -2470,7 +2909,7 @@ class TestPagingDatasetChanges(BasePagingTester, PageAssertionMixin):
 
     def test_cell_TTL_expiry_during_paging(self):
         session = self.prepare()
-        self.create_ks(session, 'test_paging_size', 2)
+        create_ks(session, 'test_paging_size', 2)
         session.execute("""
             CREATE TABLE paging_test (
                 id int,
@@ -2538,7 +2977,7 @@ class TestPagingDatasetChanges(BasePagingTester, PageAssertionMixin):
         cluster.populate(3).start()
         node1, node2, node3 = cluster.nodelist()
         session = self.cql_connection(node1)
-        self.create_ks(session, 'test_paging_size', 1)
+        create_ks(session, 'test_paging_size', 1)
         session.execute("CREATE TABLE paging_test ( id uuid, mytext text, PRIMARY KEY (id, mytext) )")
 
         def make_uuid(text):
@@ -2579,7 +3018,7 @@ class TestPagingQueryIsolation(BasePagingTester, PageAssertionMixin):
         Interleave some paged queries and make sure nothing bad happens.
         """
         session = self.prepare()
-        self.create_ks(session, 'test_paging_size', 2)
+        create_ks(session, 'test_paging_size', 2)
         session.execute("CREATE TABLE paging_test ( id int, mytext text, PRIMARY KEY (id, mytext) )")
 
         def random_txt(text):
@@ -2664,7 +3103,7 @@ class TestPagingWithDeletions(BasePagingTester, PageAssertionMixin):
 
     def setup_data(self):
 
-        self.create_ks(self.session, 'test_paging_size', 2)
+        create_ks(self.session, 'test_paging_size', 2)
         self.session.execute("CREATE TABLE paging_test ( "
                              "id int, mytext text, col1 int, col2 int, col3 int, "
                              "PRIMARY KEY (id, mytext) )")
@@ -2941,7 +3380,7 @@ class TestPagingWithDeletions(BasePagingTester, PageAssertionMixin):
     def test_failure_threshold_deletions(self):
         """Test that paging throws a failure in case of tombstone threshold """
 
-        supports_v5_protocol = LooseVersion(self.cluster.version()) >= LooseVersion('3.10')
+        supports_v5_protocol = self.cluster.version() >= LooseVersion('3.10')
 
         self.allow_log_errors = True
         self.cluster.set_configuration_options(
@@ -2963,7 +3402,7 @@ class TestPagingWithDeletions(BasePagingTester, PageAssertionMixin):
         try:
             self.session.execute(SimpleStatement("select * from paging_test", fetch_size=1000, consistency_level=CL.ALL, retry_policy=FallthroughRetryPolicy()))
         except ReadTimeout as exc:
-            self.assertTrue(LooseVersion(self.cluster.version()) < LooseVersion('2.2'))
+            self.assertTrue(self.cluster.version() < LooseVersion('2.2'))
         except ReadFailure as exc:
             if supports_v5_protocol:
                 self.assertIsNotNone(exc.error_code_map)
@@ -2979,7 +3418,7 @@ class TestPagingWithDeletions(BasePagingTester, PageAssertionMixin):
         else:
             failure_msg = ("Scanned over.* tombstones during query.* query aborted")
 
-        self.wait_for_any_log(self.cluster.nodelist(), failure_msg, 25)
+        self.cluster.wait_for_any_log(failure_msg, 25)
 
     @since('2.2.6')
     def test_deletion_with_distinct_paging(self):
@@ -2989,7 +3428,7 @@ class TestPagingWithDeletions(BasePagingTester, PageAssertionMixin):
         @jira_ticket CASSANDRA-10010
         """
         self.session = self.prepare()
-        self.create_ks(self.session, 'test_paging_size', 2)
+        create_ks(self.session, 'test_paging_size', 2)
         self.session.execute("CREATE TABLE paging_test ( "
                              "k int, s int static, c int, v int, "
                              "PRIMARY KEY (k, c) )")

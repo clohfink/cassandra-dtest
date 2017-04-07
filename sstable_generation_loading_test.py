@@ -5,9 +5,8 @@ from distutils import dir_util
 
 from ccmlib import common as ccmcommon
 
+from dtest import Tester, debug, create_ks, create_cf
 from tools.assertions import assert_one
-from dtest import Tester, debug
-from tools.decorators import known_failure
 
 
 # WARNING: sstableloader tests should be added to TestSSTableGenerationAndLoading (below),
@@ -20,79 +19,42 @@ class BaseSStableLoaderTest(Tester):
     __test__ = False
     upgrade_from = None
     compact = False
-    jvm_args = None
-
-    def __init__(self, *argv, **kwargs):
-        if self.jvm_args is None:
-            self.jvm_args = []
-        kwargs['cluster_options'] = {'start_rpc': True}
-        Tester.__init__(self, *argv, **kwargs)
-        self.allow_log_errors = True
+    jvm_args = ()
+    allow_log_errors = True
 
     def create_schema(self, session, ks, compression):
-        self.create_ks(session, ks, rf=2)
-        self.create_cf(session, "standard1", compression=compression, compact_storage=self.compact)
-        self.create_cf(session, "counter1", compression=compression, columns={'v': 'counter'},
-                       compact_storage=self.compact)
+        create_ks(session, ks, rf=2)
+        create_cf(session, "standard1", compression=compression, compact_storage=self.compact)
+        create_cf(session, "counter1", compression=compression, columns={'v': 'counter'},
+                  compact_storage=self.compact)
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11897',
-                   flaky=True,
-                   notes='windows')
     def sstableloader_compression_none_to_none_test(self):
         self.load_sstable_with_configuration(None, None)
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-12137',
-                   flaky=True)
     def sstableloader_compression_none_to_snappy_test(self):
         self.load_sstable_with_configuration(None, 'Snappy')
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11897',
-                   flaky=True,
-                   notes='windows')
     def sstableloader_compression_none_to_deflate_test(self):
         self.load_sstable_with_configuration(None, 'Deflate')
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11897',
-                   flaky=True,
-                   notes='windows')
     def sstableloader_compression_snappy_to_none_test(self):
         self.load_sstable_with_configuration('Snappy', None)
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-12137',
-                   flaky=True)
     def sstableloader_compression_snappy_to_snappy_test(self):
         self.load_sstable_with_configuration('Snappy', 'Snappy')
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11897',
-                   flaky=True,
-                   notes='windows')
     def sstableloader_compression_snappy_to_deflate_test(self):
         self.load_sstable_with_configuration('Snappy', 'Deflate')
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-12137',
-                   flaky=True)
     def sstableloader_compression_deflate_to_none_test(self):
         self.load_sstable_with_configuration('Deflate', None)
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-12137',
-                   flaky=True)
     def sstableloader_compression_deflate_to_snappy_test(self):
         self.load_sstable_with_configuration('Deflate', 'Snappy')
 
     def sstableloader_compression_deflate_to_deflate_test(self):
         self.load_sstable_with_configuration('Deflate', 'Deflate')
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-12137',
-                   flaky=True)
     def sstableloader_with_mv_test(self):
         """
         @jira_ticket CASSANDRA-11275
@@ -130,8 +92,8 @@ class BaseSStableLoaderTest(Tester):
             default_install_dir = self.cluster.get_install_dir()
             # Forcing cluster version on purpose
             cluster.set_install_dir(version=self.upgrade_from)
-        debug("Using jvm_args=%s" % self.jvm_args)
-        cluster.populate(2).start(jvm_args=self.jvm_args)
+        debug("Using jvm_args={}".format(self.jvm_args))
+        cluster.populate(2).start(jvm_args=list(self.jvm_args))
         node1, node2 = cluster.nodelist()
         time.sleep(.5)
 
@@ -168,7 +130,7 @@ class BaseSStableLoaderTest(Tester):
             # Return to previous version
             cluster.set_install_dir(install_dir=default_install_dir)
 
-        cluster.start(jvm_args=self.jvm_args)
+        cluster.start(jvm_args=list(self.jvm_args))
         time.sleep(5)  # let gossip figure out what is going on
 
         debug("re-creating the keyspace and column families.")
@@ -254,8 +216,8 @@ class TestSSTableGenerationAndLoading(BaseSStableLoaderTest):
         time.sleep(.5)
 
         session = self.patient_cql_connection(node1)
-        self.create_ks(session, 'ks', 1)
-        self.create_cf(session, 'cf', compression="Deflate")
+        create_ks(session, 'ks', 1)
+        create_cf(session, 'cf', compression="Deflate")
 
         # make unique column names, and values that are incompressible
         for col in xrange(10):

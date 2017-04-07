@@ -5,10 +5,10 @@ from unittest import skipIf
 from cassandra import ConsistencyLevel, Timeout, Unavailable
 from cassandra.query import SimpleStatement
 
-from dtest import CASSANDRA_DIR, Tester, debug
+from dtest import CASSANDRA_DIR, Tester, debug, create_ks
 from tools.assertions import (assert_all, assert_invalid, assert_one,
                               assert_unavailable)
-from tools.decorators import known_failure, since
+from tools.decorators import since
 
 
 class TestBatch(Tester):
@@ -168,7 +168,7 @@ class TestBatch(Tester):
         """ Test that logged batch throws UAE if there aren't enough live nodes """
         session = self.prepare(nodes=3)
         [node.stop(wait_other_notice=True) for node in self.cluster.nodelist()[1:]]
-        session.consistency_level = 'ONE'
+        session.consistency_level = ConsistencyLevel.ONE
         assert_unavailable(session.execute, """
             BEGIN BATCH
             INSERT INTO users (id, firstname, lastname) VALUES (0, 'Jack', 'Sparrow')
@@ -176,9 +176,6 @@ class TestBatch(Tester):
             APPLY BATCH
         """)
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-12383',
-                   flaky=True)
     def logged_batch_doesnt_throw_uae_test(self):
         """ Test that logged batch DOES NOT throw UAE if there are at least 2 live nodes """
         session = self.prepare(nodes=3)
@@ -188,9 +185,12 @@ class TestBatch(Tester):
             INSERT INTO users (id, firstname, lastname) VALUES (0, 'Jack', 'Sparrow')
             INSERT INTO users (id, firstname, lastname) VALUES (1, 'Will', 'Turner')
             APPLY BATCH
-        """, consistency_level=ConsistencyLevel.ANY)
+        """, consistency_level=ConsistencyLevel.ONE)
         session.execute(query)
-        assert_all(session, "SELECT * FROM users", [[1, u'Will', u'Turner'], [0, u'Jack', u'Sparrow']])
+
+        self.cluster.nodelist()[-1].start(wait_for_binary_proto=True, wait_other_notice=True)
+        assert_all(session, "SELECT * FROM users", [[1, u'Will', u'Turner'], [0, u'Jack', u'Sparrow']],
+                   cl=ConsistencyLevel.ALL)
 
     def acknowledged_by_batchlog_not_set_when_batchlog_write_fails_test(self):
         """ Test that acknowledged_by_batchlog is False if batchlog can't be written """
@@ -292,7 +292,7 @@ class TestBatch(Tester):
 
         Here we have one 3.0 node and two 2.2 nodes and we send the batch request to the 3.0 node.
         """
-        self._logged_batch_compatibility_test(0, 1, 'git:cassandra-2.2', 2, 4)
+        self._logged_batch_compatibility_test(0, 1, 'github:apache/cassandra-2.2', 2, 4)
 
     @since('3.0', max_version='3.0.x')
     @skipIf(sys.platform == 'win32', 'Windows production support only on 2.2+')
@@ -302,7 +302,7 @@ class TestBatch(Tester):
 
         Here we have one 3.0 node and two 2.1 nodes and we send the batch request to the 3.0 node.
         """
-        self._logged_batch_compatibility_test(0, 1, 'git:cassandra-2.1', 2, 3)
+        self._logged_batch_compatibility_test(0, 1, 'github:apache/cassandra-2.1', 2, 3)
 
     @since('3.0', max_version='3.0.x')
     @skipIf(sys.platform == 'win32', 'Windows production support only on 2.2+')
@@ -312,7 +312,7 @@ class TestBatch(Tester):
 
         Here we have two 3.0 nodes and one 2.1 node and we send the batch request to the 3.0 node.
         """
-        self._logged_batch_compatibility_test(0, 2, 'git:cassandra-2.1', 1, 3)
+        self._logged_batch_compatibility_test(0, 2, 'github:apache/cassandra-2.1', 1, 3)
 
     @since('3.0', max_version='3.0.x')
     def logged_batch_compatibility_4_test(self):
@@ -321,7 +321,7 @@ class TestBatch(Tester):
 
         Here we have two 3.0 nodes and one 2.2 node and we send the batch request to the 2.2 node.
         """
-        self._logged_batch_compatibility_test(2, 2, 'git:cassandra-2.2', 1, 4)
+        self._logged_batch_compatibility_test(2, 2, 'github:apache/cassandra-2.2', 1, 4)
 
     @since('3.0', max_version='3.0.x')
     @skipIf(sys.platform == 'win32', 'Windows production support only on 2.2+')
@@ -331,7 +331,7 @@ class TestBatch(Tester):
 
         Here we have two 3.0 nodes and one 2.1 node and we send the batch request to the 2.1 node.
         """
-        self._logged_batch_compatibility_test(2, 2, 'git:cassandra-2.1', 1, 3)
+        self._logged_batch_compatibility_test(2, 2, 'github:apache/cassandra-2.1', 1, 3)
 
     def _logged_batch_compatibility_test(self, coordinator_idx, current_nodes, previous_version, previous_nodes, protocol_version):
         session = self.prepare_mixed(coordinator_idx, current_nodes, previous_version, previous_nodes, protocol_version=protocol_version)
@@ -383,7 +383,7 @@ class TestBatch(Tester):
 
     def create_schema(self, session, rf):
         debug('Creating schema...')
-        self.create_ks(session, 'ks', rf)
+        create_ks(session, 'ks', rf)
 
         session.execute("""
             CREATE TABLE clicks (

@@ -5,12 +5,13 @@ import re
 import time
 from random import randrange
 from threading import Thread
+from unittest import skip
 
 from cassandra.concurrent import execute_concurrent
 from ccmlib.node import Node
 
-from dtest import Tester, debug
-from tools.decorators import known_failure, require, since
+from dtest import Tester, debug, create_ks
+from tools.decorators import since
 
 
 def wait(delay=2):
@@ -20,16 +21,9 @@ def wait(delay=2):
     time.sleep(delay)
 
 
-@known_failure(failure_source='cassandra',
-               jira_url='https://issues.apache.org/jira/browse/CASSANDRA-10699',
-               flaky=True)
-@require(10699)
+@skip('awaiting CASSANDRA-10699')
 class TestConcurrentSchemaChanges(Tester):
-
-    def __init__(self, *argv, **kwargs):
-        kwargs['cluster_options'] = {'start_rpc': 'true'}
-        super(TestConcurrentSchemaChanges, self).__init__(*argv, **kwargs)
-        self.allow_log_errors = True
+    allow_log_errors = True
 
     def prepare_for_changes(self, session, namespace='ns1'):
         """
@@ -37,7 +31,7 @@ class TestConcurrentSchemaChanges(Tester):
         """
         debug("prepare_for_changes() " + str(namespace))
         # create a keyspace that will be used
-        self.create_ks(session, "ks_%s" % namespace, 2)
+        create_ks(session, "ks_%s" % namespace, 2)
         session.execute('USE ks_%s' % namespace)
 
         # create a column family with an index and a row of data
@@ -67,7 +61,7 @@ class TestConcurrentSchemaChanges(Tester):
         session.execute(query)
 
         # make a keyspace that can be deleted
-        self.create_ks(session, "ks2_%s" % namespace, 2)
+        create_ks(session, "ks2_%s" % namespace, 2)
 
     def make_schema_changes(self, session, namespace='ns1'):
         """
@@ -90,7 +84,7 @@ class TestConcurrentSchemaChanges(Tester):
         wait(2)
 
         # create keyspace
-        self.create_ks(session, "ks3_%s" % namespace, 2)
+        create_ks(session, "ks3_%s" % namespace, 2)
         session.execute('USE ks_%s' % namespace)
 
         wait(2)

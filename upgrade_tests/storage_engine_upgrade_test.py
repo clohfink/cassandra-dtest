@@ -1,9 +1,14 @@
 import os
 import time
 
-from tools.assertions import assert_all, assert_none, assert_one
-from dtest import Tester, debug
+from dtest import CASSANDRA_VERSION_FROM_BUILD, Tester, debug
 from sstable_generation_loading_test import BaseSStableLoaderTest
+from thrift_bindings.v22.Cassandra import (ConsistencyLevel, Deletion,
+                                           Mutation, SlicePredicate,
+                                           SliceRange)
+from thrift_tests import composite, get_thrift_client, i32
+from tools.assertions import (assert_all, assert_length_equal, assert_none,
+                              assert_one)
 from tools.decorators import since
 from tools.misc import new_node
 
@@ -23,11 +28,17 @@ class TestStorageEngineUpgrade(Tester):
             jvm_args = []
         self.jvm_args = jvm_args
 
-    def _setup_cluster(self, create_keyspace=True):
+    def _setup_cluster(self, create_keyspace=True, cluster_options=None):
         cluster = self.cluster
 
+        if cluster_options:
+            cluster.set_configuration_options(cluster_options)
+
         # Forcing cluster version on purpose
-        cluster.set_install_dir(version="2.1.9")
+        if CASSANDRA_VERSION_FROM_BUILD >= '4':
+            cluster.set_install_dir(version="git:cassandra-3.0")
+        else:
+            cluster.set_install_dir(version="git:cassandra-2.1")
         cluster.populate(1).start()
 
         node1 = cluster.nodelist()[0]
@@ -380,6 +391,56 @@ class TestStorageEngineUpgrade(Tester):
 
         assert_one(session, "SELECT k FROM t", ['some_key'])
 
+    @since('3.0', max_version='4')
+    def upgrade_with_range_tombstone_eoc_0_test(self):
+        """
+        Check sstable upgrading when the sstable contains a range tombstone with EOC=0.
+
+        @jira_ticket CASSANDRA-12423
+        """
+        session = self._setup_cluster(cluster_options={'start_rpc': 'true'})
+
+        session.execute("CREATE TABLE rt (id INT, c1 TEXT, c2 TEXT, v INT, PRIMARY KEY (id, c1, c2)) "
+                        "with compact storage and compression = {'sstable_compression': ''};")
+
+        range_delete = {
+            i32(1): {
+                'rt': [Mutation(deletion=Deletion(2470761440040513,
+                                                  predicate=SlicePredicate(slice_range=SliceRange(
+                                                      start=composite('a', eoc='\x00'),
+                                                      finish=composite('asd', eoc='\x00')))))]
+            }
+        }
+
+        client = get_thrift_client()
+        client.transport.open()
+        client.set_keyspace('ks')
+        client.batch_mutate(range_delete, ConsistencyLevel.ONE)
+        client.transport.close()
+
+        session.execute("INSERT INTO rt (id, c1, c2, v) VALUES (1, 'asd', '', 0) USING TIMESTAMP 1470761451368658")
+        session.execute("INSERT INTO rt (id, c1, c2, v) VALUES (1, 'asd', 'asd', 0) USING TIMESTAMP 1470761449416613")
+
+        session = self._do_upgrade()
+
+        ret = list(session.execute('SELECT * FROM rt'))
+        assert_length_equal(ret, 2)
+
+    @since('3.0')
+    def upgrade_with_range_tombstone_ae_test(self):
+        """
+        Certain range tombstone pattern causes AssertionError when upgrade.
+        This test makes sure it won't happeen.
+
+        @jira_ticket CASSANDRA-12203
+        """
+        session = self._setup_cluster()
+        session.execute('CREATE TABLE test (k ascii, c1 ascii, c2 int, c3 int, val text, PRIMARY KEY (k, c1, c2, c3))')
+        session.execute("DELETE FROM ks.test WHERE k = 'a' AND c1 = 'a'")
+        session.execute("DELETE FROM ks.test WHERE k = 'a' AND c1 = 'a' AND c2 = 1")
+        session = self._do_upgrade()
+        assert_none(session, "SELECT k FROM test")
+
 
 @since('3.0')
 class TestBootstrapAfterUpgrade(TestStorageEngineUpgrade):
@@ -388,14 +449,14 @@ class TestBootstrapAfterUpgrade(TestStorageEngineUpgrade):
         super(TestBootstrapAfterUpgrade, self).setUp(bootstrap=True, jvm_args=LEGACY_SSTABLES_JVM_ARGS)
 
 
-@since('3.0')
+@since('3.0', max_version='4')
 class TestLoadKaSStables(BaseSStableLoaderTest):
     __test__ = True
     upgrade_from = '2.1.6'
     jvm_args = LEGACY_SSTABLES_JVM_ARGS
 
 
-@since('3.0')
+@since('3.0', max_version='4')
 class TestLoadKaCompactSStables(BaseSStableLoaderTest):
     __test__ = True
     upgrade_from = '2.1.6'
@@ -403,14 +464,14 @@ class TestLoadKaCompactSStables(BaseSStableLoaderTest):
     compact = True
 
 
-@since('3.0')
+@since('3.0', max_version='4')
 class TestLoadLaSStables(BaseSStableLoaderTest):
     __test__ = True
     upgrade_from = '2.2.4'
     jvm_args = LEGACY_SSTABLES_JVM_ARGS
 
 
-@since('3.0')
+@since('3.0', max_version='4')
 class TestLoadLaCompactSStables(BaseSStableLoaderTest):
     __test__ = True
     upgrade_from = '2.2.4'

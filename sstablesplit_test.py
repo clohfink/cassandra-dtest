@@ -9,10 +9,6 @@ from dtest import Tester, debug
 
 class TestSSTableSplit(Tester):
 
-    def __init__(self, *args, **kwargs):
-        kwargs['cluster_options'] = {'start_rpc': 'true'}
-        Tester.__init__(self, *args, **kwargs)
-
     def split_test(self):
         """
         Check that after running compaction, sstablessplit can succesfully split

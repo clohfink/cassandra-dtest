@@ -10,47 +10,32 @@ from cassandra import ConsistencyLevel
 from cassandra.concurrent import execute_concurrent_with_args
 from ccmlib.node import NodeError
 
-from tools.assertions import assert_almost_equal, assert_not_running, assert_one, assert_stderr_clean
-from dtest import DISABLE_VNODES, Tester, debug
+from dtest import DISABLE_VNODES, Tester, debug, create_ks, create_cf
+from tools.assertions import (assert_almost_equal, assert_bootstrap_state, assert_not_running,
+                              assert_one, assert_stderr_clean)
 from tools.data import query_c1c2
-from tools.decorators import known_failure, no_vnodes, since
+from tools.decorators import no_vnodes, since
 from tools.intervention import InterruptBootstrap, KillOnBootstrap
 from tools.misc import new_node
-
-
-def assert_bootstrap_state(tester, node, expected_bootstrap_state):
-    """
-    Assert that a node is on a given bootstrap state
-    @param tester The dtest.Tester object to fetch the exclusive connection to the node
-    @param node The node to check bootstrap state
-    @param expected_bootstrap_state Bootstrap state to expect
-
-    Examples:
-    assert_bootstrap_state(self, node3, 'COMPLETED')
-    """
-    session = tester.patient_exclusive_cql_connection(node)
-    assert_one(session, "SELECT bootstrapped FROM system.local WHERE key='local'", [expected_bootstrap_state])
+from tools.misc import generate_ssl_stores
 
 
 class BaseBootstrapTest(Tester):
     __test__ = False
 
-    def __init__(self, *args, **kwargs):
-        kwargs['cluster_options'] = {'start_rpc': 'true'}
-        # Ignore these log patterns:
-        self.ignore_log_patterns = [
-            # This one occurs when trying to send the migration to a
-            # node that hasn't started yet, and when it does, it gets
-            # replayed and everything is fine.
-            r'Can\'t send migration request: node.*is down',
-            # ignore streaming error during bootstrap
-            r'Exception encountered during startup',
-            r'Streaming error occurred'
-        ]
-        Tester.__init__(self, *args, **kwargs)
-        self.allow_log_errors = True
+    allow_log_errors = True
+    ignore_log_patterns = (
+        # This one occurs when trying to send the migration to a
+        # node that hasn't started yet, and when it does, it gets
+        # replayed and everything is fine.
+        r'Can\'t send migration request: node.*is down',
+        # ignore streaming error during bootstrap
+        r'Exception encountered during startup',
+        r'Streaming error occurred'
+    )
 
-    def _base_bootstrap_test(self, bootstrap=None, bootstrap_from_version=None):
+    def _base_bootstrap_test(self, bootstrap=None, bootstrap_from_version=None,
+                             enable_ssl=None):
         def default_bootstrap(cluster, token):
             node2 = new_node(cluster)
             node2.set_configuration_options(values={'initial_token': token})
@@ -61,6 +46,12 @@ class BaseBootstrapTest(Tester):
             bootstrap = default_bootstrap
 
         cluster = self.cluster
+
+        if enable_ssl:
+            debug("***using internode ssl***")
+            generate_ssl_stores(self.test_path)
+            cluster.enable_internode_ssl(self.test_path)
+
         tokens = cluster.balanced_tokens(2)
         cluster.set_configuration_options(values={'num_tokens': 1})
 
@@ -78,8 +69,8 @@ class BaseBootstrapTest(Tester):
         cluster.start(wait_other_notice=True)
 
         session = self.patient_cql_connection(node1)
-        self.create_ks(session, 'ks', 1)
-        self.create_cf(session, 'cf', columns={'c1': 'text', 'c2': 'text'})
+        create_ks(session, 'ks', 1)
+        create_cf(session, 'cf', columns={'c1': 'text', 'c2': 'text'})
 
         # record the size before inserting any of our own data
         empty_size = node1.data_size()
@@ -122,6 +113,11 @@ class BaseBootstrapTest(Tester):
 
 
 class TestBootstrap(BaseBootstrapTest):
+    __test__ = True
+
+    @no_vnodes()
+    def simple_bootstrap_test_with_ssl(self):
+        self._base_bootstrap_test(enable_ssl=True)
 
     @no_vnodes()
     def simple_bootstrap_test(self):
@@ -152,23 +148,28 @@ class TestBootstrap(BaseBootstrapTest):
         2*streaming_keep_alive_period_in_secs to receive a single sstable
         """
         cluster = self.cluster
-        cluster.set_configuration_options(values={'stream_throughput_outbound_megabits_per_sec': 1,
-                                                  'streaming_socket_timeout_in_ms': 1000,
-                                                  'streaming_keep_alive_period_in_secs': 1})
+        cluster.set_configuration_options(values={'streaming_socket_timeout_in_ms': 1000,
+                                                  'streaming_keep_alive_period_in_secs': 2})
 
         # Create a single node cluster
         cluster.populate(1)
         node1 = cluster.nodelist()[0]
+
+        debug("Setting up byteman on {}".format(node1.name))
+        # set up byteman
+        node1.byteman_port = '8100'
+        node1.import_config_files()
+
         cluster.start(wait_other_notice=True)
 
         # Create more than one sstable larger than 1MB
-        node1.stress(['write', 'n=50K', '-rate', 'threads=8', '-schema',
+        node1.stress(['write', 'n=1K', '-rate', 'threads=8', '-schema',
                       'compaction(strategy=SizeTieredCompactionStrategy, enabled=false)'])
         cluster.flush()
-        node1.stress(['write', 'n=50K', '-rate', 'threads=8', '-schema',
-                      'compaction(strategy=SizeTieredCompactionStrategy, enabled=false)'])
-        cluster.flush()
-        self.assertGreater(node1.get_sstables("keyspace1", "standard1"), 1)
+
+        debug("Submitting byteman script to {} to".format(node1.name))
+        # Sleep longer than streaming_socket_timeout_in_ms to make sure the node will not be killed
+        node1.byteman_submit(['./byteman/stream_5s_sleep.btm'])
 
         # Bootstraping a new node with very small streaming_socket_timeout_in_ms
         node2 = new_node(cluster)
@@ -178,7 +179,7 @@ class TestBootstrap(BaseBootstrapTest):
         assert_bootstrap_state(self, node2, 'COMPLETED')
 
         for node in cluster.nodelist():
-            self.assertTrue(node.grep_log('Scheduling keep-alive task with 1s period.', filename='debug.log'))
+            self.assertTrue(node.grep_log('Scheduling keep-alive task with 2s period.', filename='debug.log'))
             self.assertTrue(node.grep_log('Sending keep-alive', filename='debug.log'))
             self.assertTrue(node.grep_log('Received keep-alive', filename='debug.log'))
 
@@ -367,7 +368,7 @@ class TestBootstrap(BaseBootstrapTest):
         # check if we reset bootstrap state
         node3.watch_log_for("Resetting bootstrap progress to start fresh", from_mark=mark)
         # wait for node3 ready to query
-        node3.watch_log_for("Listening for thrift clients...", from_mark=mark)
+        node3.wait_for_binary_interface(from_mark=mark)
 
         # check if 2nd bootstrap succeeded
         assert_bootstrap_state(self, node3, 'COMPLETED')
@@ -399,10 +400,6 @@ class TestBootstrap(BaseBootstrapTest):
         current_rows = list(session.execute("SELECT * FROM %s" % stress_table))
         self.assertEquals(original_rows, current_rows)
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-12437',
-                   flaky=True,
-                   notes='Windows')
     def local_quorum_bootstrap_test(self):
         """
         Test that CL local_quorum works while a node is bootstrapping.
@@ -457,17 +454,9 @@ class TestBootstrap(BaseBootstrapTest):
         failure = regex.search(out)
         self.assertIsNone(failure, "Error during stress while bootstrapping")
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11281',
-                   flaky=True,
-                   notes='windows')
     def shutdown_wiped_node_cannot_join_test(self):
         self._wiped_node_cannot_join_test(gently=True)
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11281',
-                   flaky=True,
-                   notes='windows')
     def killed_wiped_node_cannot_join_test(self):
         self._wiped_node_cannot_join_test(gently=False)
 
@@ -506,10 +495,6 @@ class TestBootstrap(BaseBootstrapTest):
         node4.start(no_wait=True, wait_other_notice=False)
         node4.watch_log_for("A node with address /127.0.0.4 already exists, cancelling join", from_mark=mark)
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11281',
-                   flaky=True,
-                   notes='windows')
     def decommissioned_wiped_node_can_join_test(self):
         """
         @jira_ticket CASSANDRA-9765
@@ -544,10 +529,6 @@ class TestBootstrap(BaseBootstrapTest):
         node4.start(wait_other_notice=True)
         node4.watch_log_for("JOINING:", from_mark=mark)
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11281',
-                   flaky=True,
-                   notes='windows')
     def decommissioned_wiped_node_can_gossip_to_single_seed_test(self):
         """
         @jira_ticket CASSANDRA-8072
@@ -559,9 +540,18 @@ class TestBootstrap(BaseBootstrapTest):
         cluster.populate(1)
         cluster.start(wait_for_binary_proto=True)
 
+        node1 = cluster.nodelist()[0]
         # Add a new node, bootstrap=True ensures that it is not a seed
         node2 = new_node(cluster, bootstrap=True)
         node2.start(wait_for_binary_proto=True, wait_other_notice=True)
+
+        session = self.patient_cql_connection(node1)
+
+        if cluster.version() >= '2.2':
+            # reduce system_distributed RF to 2 so we don't require forceful decommission
+            session.execute("ALTER KEYSPACE system_distributed WITH REPLICATION = {'class':'SimpleStrategy', 'replication_factor':'1'};")
+
+        session.execute("ALTER KEYSPACE system_traces WITH REPLICATION = {'class':'SimpleStrategy', 'replication_factor':'1'};")
 
         # Decommision the new node and kill it
         debug("Decommissioning & stopping node2")
@@ -583,10 +573,6 @@ class TestBootstrap(BaseBootstrapTest):
         node2.start(wait_other_notice=False)
         node2.watch_log_for("JOINING:", from_mark=mark)
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11281',
-                   flaky=True,
-                   notes='windows, one fail on linux no-vnode 2.2')
     def failed_bootstrap_wiped_node_can_join_test(self):
         """
         @jira_ticket CASSANDRA-9765
@@ -638,10 +624,8 @@ class TestBootstrap(BaseBootstrapTest):
         @jira_ticket CASSANDRA-9484
         """
 
-        bootstrap_error = ("Other bootstrapping/leaving/moving nodes detected,"
-                           " cannot bootstrap while cassandra.consistent.rangemovement is true")
-
-        self.ignore_log_patterns.append(bootstrap_error)
+        bootstrap_error = "Other bootstrapping/leaving/moving nodes detected," \
+                          " cannot bootstrap while cassandra.consistent.rangemovement is true"
 
         cluster = self.cluster
         cluster.populate(1)
@@ -656,13 +640,15 @@ class TestBootstrap(BaseBootstrapTest):
         node2.start(wait_other_notice=True)
 
         node3 = new_node(cluster, remote_debug_port='2003')
-        process = node3.start(wait_other_notice=False)
-        stdout, stderr = process.communicate()
-        self.assertIn(bootstrap_error, stderr, msg=stderr)
-        time.sleep(.5)
-        self.assertFalse(node3.is_running(), msg="Two nodes bootstrapped simultaneously")
+        try:
+            node3.start(wait_other_notice=False, verbose=False)
+        except NodeError:
+            pass  # node doesn't start as expected
 
+        time.sleep(.5)
         node2.watch_log_for("Starting listening for CQL clients")
+
+        node3.watch_log_for(bootstrap_error)
 
         session = self.patient_exclusive_cql_connection(node2)
 

@@ -4,8 +4,7 @@
 futures
 six
 -e git+https://github.com/datastax/python-driver.git@cassandra-test#egg=cassandra-driver
-
--e git+https://github.com/pcmanus/ccm.git@master#egg=ccm
+ccm==2.6.0
 cql
 decorator
 docopt
@@ -15,6 +14,7 @@ mock
 nose
 nose-test-select
 parse
+pep8
 psutil
 pycassa
-thrift
+thrift==0.9.3

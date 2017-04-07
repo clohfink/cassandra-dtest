@@ -2,18 +2,17 @@ import os
 import tempfile
 from itertools import chain
 from shutil import rmtree
+from unittest import skipIf
 
 from cassandra import ConsistencyLevel, ReadTimeout, Unavailable
 from cassandra.query import SimpleStatement
 from ccmlib.node import Node
 from nose.plugins.attrib import attr
 
-from dtest import DISABLE_VNODES, Tester, debug
-from tools.assertions import assert_not_running, assert_all
+from dtest import CASSANDRA_VERSION_FROM_BUILD, DISABLE_VNODES, Tester, debug
+from tools.assertions import assert_bootstrap_state, assert_all, assert_not_running
 from tools.data import rows_to_list
-from tools.decorators import known_failure, since
-
-from bootstrap_test import assert_bootstrap_state
+from tools.decorators import since
 
 
 class NodeUnavailable(Exception):
@@ -22,22 +21,17 @@ class NodeUnavailable(Exception):
 
 class BaseReplaceAddressTest(Tester):
     __test__ = False
-
-    def __init__(self, *args, **kwargs):
-        kwargs['cluster_options'] = {'start_rpc': 'true'}
-        self.replacement_node = None
-        # Ignore these log patterns:
-        self.ignore_log_patterns = [
-            # This one occurs when trying to send the migration to a
-            # node that hasn't started yet, and when it does, it gets
-            # replayed and everything is fine.
-            r'Can\'t send migration request: node.*is down',
-            r'Migration task failed to complete',  # 10978
-            # ignore streaming error during bootstrap
-            r'Streaming error occurred',
-            r'failed stream session'
-        ]
-        Tester.__init__(self, *args, **kwargs)
+    replacement_node = None
+    ignore_log_patterns = (
+        # This one occurs when trying to send the migration to a
+        # node that hasn't started yet, and when it does, it gets
+        # replayed and everything is fine.
+        r'Can\'t send migration request: node.*is down',
+        r'Migration task failed to complete',  # 10978
+        # ignore streaming error during bootstrap
+        r'Streaming error occurred',
+        r'failed stream session'
+    )
 
     def _setup(self, n=3, opts=None, enable_byteman=False, mixed_versions=False):
         debug("Starting cluster with {} nodes.".format(n))
@@ -91,7 +85,7 @@ class BaseReplaceAddressTest(Tester):
 
             debug("Starting replacement node {} with jvm_option '{}={}'".format(replacement_address, jvm_option, replace_address))
             self.replacement_node = Node('replacement', cluster=self.cluster, auto_bootstrap=True,
-                                         thrift_interface=(replacement_address, 9160), storage_interface=(replacement_address, 7000),
+                                         thrift_interface=None, storage_interface=(replacement_address, 7000),
                                          jmx_port='7400', remote_debug_port='0', initial_token=None, binary_interface=(replacement_address, 9042))
             if opts is not None:
                 debug("Setting options on replacement node: {}".format(opts))
@@ -117,13 +111,10 @@ class BaseReplaceAddressTest(Tester):
             self.replaced_node.stop(gently=gently, wait_other_notice=True)
 
         debug("Testing node stoppage (query should fail).")
-        with self.assertRaises(NodeUnavailable):
-            try:
-                session = self.patient_cql_connection(self.query_node)
-                query = SimpleStatement('select * from {}'.format(table), consistency_level=cl)
-                session.execute(query)
-            except (Unavailable, ReadTimeout):
-                raise NodeUnavailable("Node could not be queried.")
+        with self.assertRaises((Unavailable, ReadTimeout)):
+            session = self.patient_cql_connection(self.query_node)
+            query = SimpleStatement('select * from {}'.format(table), consistency_level=cl)
+            session.execute(query)
 
     def _insert_data(self, n='1k', rf=3, whitelist=False):
         debug("Inserting {} entries with rf={} with stress...".format(n, rf))
@@ -239,10 +230,6 @@ class BaseReplaceAddressTest(Tester):
 class TestReplaceAddress(BaseReplaceAddressTest):
     __test__ = True
 
-    @known_failure(failure_source='systemic',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11652',
-                   flaky=True,
-                   notes='windows')
     @attr('resource-intensive')
     def replace_stopped_node_test(self):
         """
@@ -324,10 +311,6 @@ class TestReplaceAddress(BaseReplaceAddressTest):
         self.replacement_node.watch_log_for("java.lang.RuntimeException: Cannot replace_address /127.0.0.5 because it doesn't exist in gossip")
         assert_not_running(self.replacement_node)
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11691',
-                   flaky=False,
-                   notes='Windows')
     @since('3.6')
     def fail_without_replace_test(self):
         """
@@ -360,10 +343,6 @@ class TestReplaceAddress(BaseReplaceAddressTest):
             node3.watch_log_for('Use cassandra.replace_address if you want to replace this node', from_mark=mark, timeout=20)
             mark = node3.mark_log()
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11700',
-                   flaky=True,
-                   notes='windows')
     @since('3.6')
     def unsafe_replace_test(self):
         """
@@ -413,6 +392,7 @@ class TestReplaceAddress(BaseReplaceAddressTest):
                 self.replacement_node.watch_log_for('To perform this operation, please restart with -Dcassandra.allow_unsafe_replace=true',
                                                     from_mark=mark, timeout=20)
 
+    @skipIf(CASSANDRA_VERSION_FROM_BUILD == '3.9', "Test doesn't run on 3.9")
     @since('2.2')
     def insert_data_during_replace_same_address_test(self):
         """
@@ -421,6 +401,7 @@ class TestReplaceAddress(BaseReplaceAddressTest):
         """
         self._test_insert_data_during_replace(same_address=True)
 
+    @skipIf(CASSANDRA_VERSION_FROM_BUILD == '3.9', "Test doesn't run on 3.9")
     @since('2.2')
     def insert_data_during_replace_different_address_test(self):
         """
@@ -429,10 +410,6 @@ class TestReplaceAddress(BaseReplaceAddressTest):
         """
         self._test_insert_data_during_replace(same_address=False)
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-12085',
-                   flaky=True,
-                   notes='windows')
     @since('2.2')
     @attr('resource-intensive')
     def resume_failed_replace_test(self):
@@ -444,8 +421,6 @@ class TestReplaceAddress(BaseReplaceAddressTest):
         """
         self._test_restart_failed_replace(mode='resume')
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11835')
     @since('2.2')
     @attr('resource-intensive')
     def restart_failed_replace_with_reset_resume_state_test(self):
@@ -461,7 +436,7 @@ class TestReplaceAddress(BaseReplaceAddressTest):
         self._test_restart_failed_replace(mode='wipe')
 
     def _test_restart_failed_replace(self, mode):
-        self.ignore_log_patterns.append(r'Error while waiting on bootstrap to complete')
+        self.ignore_log_patterns = list(self.ignore_log_patterns) + [r'Error while waiting on bootstrap to complete']
         self._setup(n=3, enable_byteman=True)
         self._insert_data(n="1k")
 
@@ -517,9 +492,6 @@ class TestReplaceAddress(BaseReplaceAddressTest):
 
         self._verify_data(initial_data)
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-12260',
-                   flaky=True)
     def replace_with_insufficient_replicas_test(self):
         """
         Test that replace fails when there are insufficient replicas
@@ -541,10 +513,6 @@ class TestReplaceAddress(BaseReplaceAddressTest):
         self.replacement_node.watch_log_for("Unable to find sufficient sources for streaming range")
         assert_not_running(self.replacement_node)
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-12276',
-                   flaky=False,
-                   notes='windows')
     def multi_dc_replace_with_rf1_test(self):
         """
         Test that multi-dc replace works when rf=1 on each dc

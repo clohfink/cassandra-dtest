@@ -1,5 +1,6 @@
 import os
 import random
+import re
 import string
 import tempfile
 import time
@@ -7,18 +8,14 @@ from distutils.version import LooseVersion
 
 import parse
 
-from dtest import Tester, debug
+from dtest import Tester, debug, create_ks
 from tools.assertions import assert_length_equal, assert_none, assert_one
-from tools.decorators import known_failure, since
+from tools.decorators import since
 
 
 class TestCompaction(Tester):
 
     __test__ = False
-
-    def __init__(self, *args, **kwargs):
-        kwargs['cluster_options'] = {'start_rpc': 'true'}
-        Tester.__init__(self, *args, **kwargs)
 
     def setUp(self):
         Tester.setUp(self)
@@ -36,7 +33,7 @@ class TestCompaction(Tester):
         [node1] = cluster.nodelist()
 
         session = self.patient_cql_connection(node1)
-        self.create_ks(session, 'ks', 1)
+        create_ks(session, 'ks', 1)
 
         session.execute("create table ks.cf (key int PRIMARY KEY, val int) with compaction = {'class':'" + self.strategy + "'} and gc_grace_seconds = 30;")
 
@@ -86,7 +83,9 @@ class TestCompaction(Tester):
             debug("datasize not found")
             debug(output)
 
-        block_on_compaction_log(node1)
+        node1.flush()
+        node1.compact()
+        node1.wait_for_compactions()
 
         output = node1.nodetool('cfstats').stdout
         if output.find(table_name) != -1:
@@ -142,7 +141,7 @@ class TestCompaction(Tester):
             dir_count = len(node1.data_directories())
             debug("sstable_count is: {}".format(sstable_count))
             debug("dir_count is: {}".format(dir_count))
-            if LooseVersion(node1.get_cassandra_version()) < LooseVersion('3.2'):
+            if node1.get_cassandra_version() < LooseVersion('3.2'):
                 size_factor = sstable_count
             else:
                 size_factor = sstable_count / float(dir_count)
@@ -163,7 +162,7 @@ class TestCompaction(Tester):
         cluster.populate(1).start(wait_for_binary_proto=True)
         [node1] = cluster.nodelist()
         session = self.patient_cql_connection(node1)
-        self.create_ks(session, 'ks', 1)
+        create_ks(session, 'ks', 1)
         session.execute("create table cf (key int PRIMARY KEY, val int) with gc_grace_seconds = 0 and compaction= {'class':'" + self.strategy + "'}")
 
         for x in range(0, 100):
@@ -172,7 +171,9 @@ class TestCompaction(Tester):
         for x in range(0, 100):
             session.execute('delete from cf where key = ' + str(x))
 
-        block_on_compaction_log(node1, ks='ks', table='cf')
+        node1.flush()
+        node1.nodetool("compact ks cf")
+        node1.wait_for_compactions()
         time.sleep(1)
         try:
             for data_dir in node1.data_directories():
@@ -200,7 +201,7 @@ class TestCompaction(Tester):
         cluster.populate(1).start(wait_for_binary_proto=True)
         [node1] = cluster.nodelist()
         session = self.patient_cql_connection(node1)
-        self.create_ks(session, 'ks', 1)
+        create_ks(session, 'ks', 1)
         # max sstable age is 0.5 minute:
         session.execute("""create table cf (key int PRIMARY KEY, val int) with gc_grace_seconds = 0
             and compaction= {'class':'DateTieredCompactionStrategy', 'max_sstable_age_days':0.00035, 'min_threshold':2}""")
@@ -212,7 +213,7 @@ class TestCompaction(Tester):
         time.sleep(40)
         expired_sstables = node1.get_sstables('ks', 'cf')
         expected_sstable_count = 1
-        if LooseVersion(self.cluster.version()) > LooseVersion('3.1'):
+        if self.cluster.version() > LooseVersion('3.1'):
             expected_sstable_count = cluster.data_dir_count
         self.assertEqual(len(expired_sstables), expected_sstable_count)
         # write a new sstable to make DTCS check for expired sstables:
@@ -252,7 +253,15 @@ class TestCompaction(Tester):
         threshold = "5"
         node1.nodetool('setcompactionthroughput -- ' + threshold)
 
-        matches = block_on_compaction_log(node1)
+        node1.flush()
+        if node1.get_cassandra_version() < '2.2':
+            log_file = 'system.log'
+        else:
+            log_file = 'debug.log'
+        mark = node1.mark_log(filename=log_file)
+        node1.compact()
+        matches = node1.watch_log_for('Compacted', from_mark=mark, filename=log_file)
+
         stringline = matches[0]
 
         throughput_pattern = '{}={avgthroughput:f}{units}/s'
@@ -260,20 +269,24 @@ class TestCompaction(Tester):
         avgthroughput = m.named['avgthroughput']
         found_units = m.named['units']
 
-        units = ['MB'] if LooseVersion(cluster.version()) < LooseVersion('3.6') else ['KiB', 'MiB', 'GiB']
+        unit_conversion_dct = {
+            "MB": 1,
+            "MiB": 1,
+            "KiB": 1. / 1024,
+            "GiB": 1024
+        }
+
+        units = ['MB'] if cluster.version() < LooseVersion('3.6') else ['KiB', 'MiB', 'GiB']
         self.assertIn(found_units, units)
 
         debug(avgthroughput)
+        avgthroughput_mb = unit_conversion_dct[found_units] * float(avgthroughput)
 
         # The throughput in the log is computed independantly from the throttling and on the output files while
         # throttling is on the input files, so while that throughput shouldn't be higher than the one set in
         # principle, a bit of wiggle room is expected
-        self.assertGreaterEqual(float(threshold) + 0.5, float(avgthroughput))
+        self.assertGreaterEqual(float(threshold) + 0.5, avgthroughput_mb)
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11281',
-                   flaky=True,
-                   notes='windows')
     def compaction_strategy_switching_test(self):
         """Ensure that switching strategies does not result in problems.
         Insert data, switch strategies, then check against data loss.
@@ -288,7 +301,7 @@ class TestCompaction(Tester):
 
             for strat in strategies:
                 session = self.patient_cql_connection(node1)
-                self.create_ks(session, 'ks', 1)
+                create_ks(session, 'ks', 1)
 
                 session.execute("create table ks.cf (key int PRIMARY KEY, val int) with gc_grace_seconds = 0 and compaction= {'class':'" + self.strategy + "'};")
 
@@ -324,7 +337,7 @@ class TestCompaction(Tester):
         [node] = cluster.nodelist()
 
         session = self.patient_cql_connection(node)
-        self.create_ks(session, 'ks', 1)
+        create_ks(session, 'ks', 1)
 
         mark = node.mark_log()
         strlen = (1024 * 1024) / 100
@@ -340,8 +353,8 @@ class TestCompaction(Tester):
 
         node.nodetool('compact ks large')
         verb = 'Writing' if self.cluster.version() > '2.2' else 'Compacting'
-        sizematcher = '\d+ bytes' if LooseVersion(self.cluster.version()) < LooseVersion('3.6') else '\d+\.\d{3}(K|M|G)iB'
-        node.watch_log_for('{} large partition ks/large:user \({}\)'.format(verb, sizematcher), from_mark=mark, timeout=180)
+        sizematcher = '\d+ bytes' if self.cluster.version() < LooseVersion('3.6') else '\d+\.\d{3}(K|M|G)iB'
+        node.watch_log_for('{} large partition ks/large:user \({}'.format(verb, sizematcher), from_mark=mark, timeout=180)
 
         ret = list(session.execute("SELECT properties from ks.large where userid = 'user'"))
         assert_length_equal(ret, 1)
@@ -355,7 +368,7 @@ class TestCompaction(Tester):
         cluster.populate(1).start(wait_for_binary_proto=True)
         [node] = cluster.nodelist()
         session = self.patient_cql_connection(node)
-        self.create_ks(session, 'ks', 1)
+        create_ks(session, 'ks', 1)
         session.execute('CREATE TABLE to_disable (id int PRIMARY KEY, d TEXT) WITH compaction = {{\'class\':\'{0}\'}}'.format(self.strategy))
         node.nodetool('disableautocompaction ks to_disable')
         for i in range(1000):
@@ -380,7 +393,7 @@ class TestCompaction(Tester):
         cluster.populate(1).start(wait_for_binary_proto=True)
         [node] = cluster.nodelist()
         session = self.patient_cql_connection(node)
-        self.create_ks(session, 'ks', 1)
+        create_ks(session, 'ks', 1)
         session.execute('CREATE TABLE to_disable (id int PRIMARY KEY, d TEXT) WITH compaction = {{\'class\':\'{0}\', \'enabled\':\'false\'}}'.format(self.strategy))
         for i in range(1000):
             session.execute('insert into to_disable (id, d) values ({0}, \'{1}\')'.format(i, 'hello' * 100))
@@ -413,7 +426,7 @@ class TestCompaction(Tester):
         cluster.populate(1).start(wait_for_binary_proto=True)
         [node] = cluster.nodelist()
         session = self.patient_cql_connection(node)
-        self.create_ks(session, 'ks', 1)
+        create_ks(session, 'ks', 1)
         session.execute('CREATE TABLE to_disable (id int PRIMARY KEY, d TEXT) WITH compaction = {{\'class\':\'{0}\'}}'.format(self.strategy))
         session.execute('ALTER TABLE to_disable WITH compaction = {{\'class\':\'{0}\', \'enabled\':\'false\'}}'.format(self.strategy))
         for i in range(1000):
@@ -441,7 +454,7 @@ class TestCompaction(Tester):
         cluster.populate(1).start(wait_for_binary_proto=True)
         [node] = cluster.nodelist()
         session = self.patient_cql_connection(node)
-        self.create_ks(session, 'ks', 1)
+        create_ks(session, 'ks', 1)
         session.execute('CREATE TABLE to_disable (id int PRIMARY KEY, d TEXT) WITH compaction = {{\'class\':\'{0}\'}}'.format(self.strategy))
         node.nodetool('disableautocompaction ks to_disable')
         for i in range(1000):
@@ -493,52 +506,68 @@ class TestCompaction(Tester):
         self.assertEquals(len(node1.data_directories()), len(sstable_files),
                           'Expected one sstable data file per node directory but got {}'.format(sstable_files))
 
+    @since('3.10')
+    def fanout_size_test(self):
+        """
+        @jira_ticket CASSANDRA-11550
+        """
+        if not hasattr(self, 'strategy') or self.strategy != 'LeveledCompactionStrategy':
+            self.skipTest('Not implemented unless LeveledCompactionStrategy is used')
+
+        cluster = self.cluster
+        cluster.populate(1).start(wait_for_binary_proto=True)
+        [node1] = cluster.nodelist()
+
+        stress_write(node1, keycount=1)
+        node1.nodetool('disableautocompaction')
+
+        session = self.patient_cql_connection(node1)
+        debug("Altering compaction strategy to LCS")
+        session.execute("ALTER TABLE keyspace1.standard1 with compaction={'class': 'LeveledCompactionStrategy', 'sstable_size_in_mb':1, 'fanout_size':10};")
+
+        stress_write(node1, keycount=1000000)
+        node1.nodetool('flush keyspace1 standard1')
+
+        # trigger the compaction
+        node1.compact()
+
+        # check the sstable count in each level
+        table_name = 'standard1'
+        output = grep_sstables_in_each_level(node1, table_name)
+
+        # [0, ?/10, ?, 0, 0, 0...]
+        p = re.compile(r'0,\s(\d+)/10,.*')
+        m = p.search(output)
+        self.assertEqual(10 * len(node1.data_directories()), int(m.group(1)))
+
+        debug("Altering the fanout_size")
+        session.execute("ALTER TABLE keyspace1.standard1 with compaction={'class': 'LeveledCompactionStrategy', 'sstable_size_in_mb':1, 'fanout_size':5};")
+
+        # trigger the compaction
+        node1.compact()
+        # check the sstable count in each level again
+        output = grep_sstables_in_each_level(node1, table_name)
+
+        # [0, ?/5, ?/25, ?, 0, 0...]
+        p = re.compile(r'0,\s(\d+)/5,\s(\d+)/25,.*')
+        m = p.search(output)
+        self.assertEqual(5 * len(node1.data_directories()), int(m.group(1)))
+        self.assertEqual(25 * len(node1.data_directories()), int(m.group(2)))
+
     def skip_if_no_major_compaction(self):
         if self.cluster.version() < '2.2' and self.strategy == 'LeveledCompactionStrategy':
             self.skipTest('major compaction not implemented for LCS in this version of Cassandra')
 
 
+def grep_sstables_in_each_level(node, table_name):
+    output = node.nodetool('cfstats').stdout
+    output = output[output.find(table_name):]
+    output = output[output.find("SSTables in each level"):]
+    return output[output.find(":") + 1:output.find("\n")].strip()
+
+
 def get_random_word(wordLen, population=string.ascii_letters + string.digits):
     return ''.join([random.choice(population) for _ in range(wordLen)])
-
-
-def block_on_compaction_log(node, ks=None, table=None):
-    """
-    @param node the node on which to trigger and block on compaction
-    @param ks the keyspace to compact
-    @param table the table to compact
-
-    Helper method for testing compaction. This triggers compactions by
-    calling flush and compact on node. In situations where major
-    compaction won't apply to a table, such as in pre-2.2 LCS tables, the
-    flush will trigger minor compactions.
-
-    This method uses log-watching to block until compaction is completed.
-
-    By default, this method uses the keyspace and table names generated by
-    cassandra-stress. These will not be used if ks and table names parameters
-    are passed in.
-
-    Calling flush before calling this method may cause it to hang; if
-    compaction completes before the method starts, it may not occur again
-    during this method.
-    """
-    if node.get_cassandra_version() < '2.2':
-        log_file = 'system.log'
-    else:
-        log_file = 'debug.log'
-    mark = node.mark_log(filename=log_file)
-    node.flush()
-
-    # on newer C* versions, default stress names are titlecased
-    stress_keyspace, stress_table = ('keyspace1', 'standard1')
-
-    ks = ks or stress_keyspace
-    table = table or stress_table
-
-    node.nodetool('compact {ks} {table}'.format(ks=ks, table=table))
-
-    return node.watch_log_for('Compacted', from_mark=mark, filename=log_file)
 
 
 def stress_write(node, keycount=100000):

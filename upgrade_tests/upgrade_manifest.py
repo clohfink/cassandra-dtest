@@ -1,5 +1,4 @@
 from collections import namedtuple
-from distutils.version import LooseVersion
 
 from dtest import (CASSANDRA_GITREF, CASSANDRA_VERSION_FROM_BUILD,
                    RUN_STATIC_UPGRADE_MATRIX, debug)
@@ -13,7 +12,7 @@ def _get_version_family():
     """
     Detects the version family (line) using dtest.py:CASSANDRA_VERSION_FROM_BUILD
     """
-    current_version = LooseVersion(CASSANDRA_VERSION_FROM_BUILD)
+    current_version = CASSANDRA_VERSION_FROM_BUILD
 
     version_family = 'unknown'
     if current_version.vstring.startswith('2.0'):
@@ -24,11 +23,13 @@ def _get_version_family():
         version_family = '2.2.x'
     elif current_version.vstring.startswith('3.0'):
         version_family = '3.0.x'
-    elif current_version > '3.0':
+    elif '3.1' <= current_version < '4.0':
         version_family = '3.x'
-    elif current_version >= '4.0':
+    elif '4.0' <= current_version < '4.1':
+        version_family = 'trunk'
+    else:
         # when this occurs, it's time to update this manifest a bit!
-        raise RuntimeError("4.0 not yet supported on upgrade tests!")
+        raise RuntimeError("4.1+ not yet supported on upgrade tests!")
 
     return version_family
 
@@ -65,17 +66,19 @@ class VersionMeta(namedtuple('_VersionMeta', ('name', 'family', 'variant', 'vers
 indev_2_0_x = None  # None if release not likely
 current_2_0_x = VersionMeta(name='current_2_0_x', family='2.0.x', variant='current', version='2.0.17', min_proto_v=1, max_proto_v=2, java_versions=(7,))
 
-indev_2_1_x = VersionMeta(name='indev_2_1_x', family='2.1.x', variant='indev', version='git:cassandra-2.1', min_proto_v=1, max_proto_v=3, java_versions=(7, 8))
-current_2_1_x = VersionMeta(name='current_2_1_x', family='2.1.x', variant='current', version='2.1.15', min_proto_v=1, max_proto_v=3, java_versions=(7, 8))
+indev_2_1_x = VersionMeta(name='indev_2_1_x', family='2.1.x', variant='indev', version='github:apache/cassandra-2.1', min_proto_v=1, max_proto_v=3, java_versions=(7, 8))
+current_2_1_x = VersionMeta(name='current_2_1_x', family='2.1.x', variant='current', version='2.1.17', min_proto_v=1, max_proto_v=3, java_versions=(7, 8))
 
-indev_2_2_x = VersionMeta(name='indev_2_2_x', family='2.2.x', variant='indev', version='git:cassandra-2.2', min_proto_v=1, max_proto_v=4, java_versions=(7, 8))
-current_2_2_x = VersionMeta(name='current_2_2_x', family='2.2.x', variant='current', version='2.2.7', min_proto_v=1, max_proto_v=4, java_versions=(7, 8))
+indev_2_2_x = VersionMeta(name='indev_2_2_x', family='2.2.x', variant='indev', version='github:apache/cassandra-2.2', min_proto_v=1, max_proto_v=4, java_versions=(7, 8))
+current_2_2_x = VersionMeta(name='current_2_2_x', family='2.2.x', variant='current', version='2.2.9', min_proto_v=1, max_proto_v=4, java_versions=(7, 8))
 
-indev_3_0_x = VersionMeta(name='indev_3_0_x', family='3.0.x', variant='indev', version='git:cassandra-3.0', min_proto_v=3, max_proto_v=4, java_versions=(8,))
-current_3_0_x = VersionMeta(name='current_3_0_x', family='3.0.x', variant='current', version='3.0.8', min_proto_v=3, max_proto_v=4, java_versions=(8,))
+indev_3_0_x = VersionMeta(name='indev_3_0_x', family='3.0.x', variant='indev', version='github:apache/cassandra-3.0', min_proto_v=3, max_proto_v=4, java_versions=(8,))
+current_3_0_x = VersionMeta(name='current_3_0_x', family='3.0.x', variant='current', version='3.0.12', min_proto_v=3, max_proto_v=4, java_versions=(8,))
 
-indev_3_x = VersionMeta(name='indev_3_x', family='3.x', variant='indev', version='git:trunk', min_proto_v=3, max_proto_v=4, java_versions=(8,))
-current_3_x = VersionMeta(name='current_3_x', family='3.x', variant='current', version='3.7', min_proto_v=3, max_proto_v=4, java_versions=(8,))
+indev_3_x = VersionMeta(name='indev_3_x', family='3.x', variant='indev', version='github:apache/cassandra-3.11', min_proto_v=3, max_proto_v=4, java_versions=(8,))
+current_3_x = VersionMeta(name='current_3_x', family='3.x', variant='current', version='3.10', min_proto_v=3, max_proto_v=4, java_versions=(8,))
+
+indev_trunk = VersionMeta(name='indev_trunk', family='trunk', variant='indev', version='github:apache/trunk', min_proto_v=3, max_proto_v=4, java_versions=(8,))
 
 
 # MANIFEST maps a VersionMeta representing a line/variant to a list of other VersionMeta's representing supported upgrades
@@ -96,17 +99,19 @@ MANIFEST = {
     current_2_2_x: [indev_2_2_x, indev_3_0_x, current_3_0_x, indev_3_x, current_3_x],
 
     indev_3_0_x: [indev_3_x, current_3_x],
-    current_3_0_x: [indev_3_0_x, indev_3_x, current_3_x],
+    current_3_0_x: [indev_3_0_x, indev_3_x, current_3_x, indev_trunk],
 
-    current_3_x: [indev_3_x],
+    current_3_x: [indev_3_x, indev_trunk],
+    indev_3_x: [indev_trunk]
 }
 
 # Local env and custom path testing instructions. Use these steps to REPLACE the normal upgrade test cases with your own.
 # 1) Add a VersionMeta for each version you wish to test (see examples below). Update the name, family, version, and protocol restrictions as needed. Use a unique name for each VersionMeta.
 # 2) Update OVERRIDE_MANIFEST (see example below).
-# 3) If using ccm local: slugs, make sure you have LOCAL_GIT_REPO defined in your env. This is the path to your git repo.
+# 3) If you want to test using local code, set the version attribute using local slugs in the format 'local:/path/to/cassandra/:branch_name'
 # 4) Run the tests!
 #      To run all, use 'nosetests -v upgrade_tests/'. To run specific tests, use 'nosetests -vs --collect-only' to preview the test names, then run nosetests using the desired test name.
+#      Note that nosetests outputs test names in a format that needs to be tweaked a bit before they will run from the command line.
 custom_1 = VersionMeta(name='custom_branch_1', family='2.1.x', variant='indev', version='local:some_branch', min_proto_v=3, max_proto_v=4, java_versions=(7, 8))
 custom_2 = VersionMeta(name='custom_branch_2', family='2.2.x', variant='indev', version='git:trunk', min_proto_v=3, max_proto_v=4, java_versions=(7, 8))
 custom_3 = VersionMeta(name='custom_branch_3', family='3.0.x', variant='indev', version='git:cassandra-3.5', min_proto_v=3, max_proto_v=4, java_versions=(7, 8))

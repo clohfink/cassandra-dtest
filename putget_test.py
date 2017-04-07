@@ -4,18 +4,15 @@ from cassandra import ConsistencyLevel
 from thrift.protocol import TBinaryProtocol
 from thrift.transport import TSocket, TTransport
 
-from dtest import Tester
+from dtest import Tester, create_ks, create_cf
 from tools.data import (create_c1c2_table, insert_c1c2, insert_columns, putget,
                         query_c1c2, query_columns, range_putget)
-from tools.decorators import known_failure, no_vnodes
-from tools.misc import retry_till_success
+from tools.decorators import no_vnodes, since
+from tools.misc import ImmutableMapping, retry_till_success
 
 
 class TestPutGet(Tester):
-
-    def __init__(self, *args, **kwargs):
-        kwargs['cluster_options'] = {'start_rpc': 'true'}
-        Tester.__init__(self, *args, **kwargs)
+    cluster_options = ImmutableMapping({'start_rpc': 'true'})
 
     def putget_test(self):
         """ Simple put/get on a single row, hitting multiple sstables """
@@ -38,15 +35,11 @@ class TestPutGet(Tester):
         node1, node2, node3 = cluster.nodelist()
 
         session = self.patient_cql_connection(node1)
-        self.create_ks(session, 'ks', 3)
-        self.create_cf(session, 'cf', compression=compression)
+        create_ks(session, 'ks', 3)
+        create_cf(session, 'cf', compression=compression)
 
         putget(cluster, session)
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11251',
-                   flaky=True,
-                   notes='windows')
     def non_local_read_test(self):
         """ This test reads from a coordinator we know has no copy of the data """
         cluster = self.cluster
@@ -55,7 +48,7 @@ class TestPutGet(Tester):
         node1, node2, node3 = cluster.nodelist()
 
         session = self.patient_cql_connection(node1)
-        self.create_ks(session, 'ks', 2)
+        create_ks(session, 'ks', 2)
         create_c1c2_table(self, session)
 
         # insert and get at CL.QUORUM (since RF=2, node1 won't have all key locally)
@@ -72,8 +65,8 @@ class TestPutGet(Tester):
         node1, node2, node3 = cluster.nodelist()
 
         session = self.patient_cql_connection(node1)
-        self.create_ks(session, 'ks', 2)
-        self.create_cf(session, 'cf')
+        create_ks(session, 'ks', 2)
+        create_cf(session, 'cf')
 
         range_putget(cluster, session)
 
@@ -85,8 +78,8 @@ class TestPutGet(Tester):
         node1, node2, node3 = cluster.nodelist()
 
         session = self.patient_cql_connection(node1)
-        self.create_ks(session, 'ks', 1)
-        self.create_cf(session, 'cf')
+        create_ks(session, 'ks', 1)
+        create_cf(session, 'cf')
 
         key = 'wide'
 
@@ -98,6 +91,7 @@ class TestPutGet(Tester):
                 query_columns(self, session, key, size, offset=x * size - 1)
 
     @no_vnodes()
+    @since('2.0', max_version='4')
     def wide_slice_test(self):
         """
         Check slicing a wide row.
@@ -133,7 +127,7 @@ class TestPutGet(Tester):
         cluster.start()
         time.sleep(.5)
         session = self.patient_cql_connection(node1)
-        self.create_ks(session, 'ks', 1)
+        create_ks(session, 'ks', 1)
 
         query = """
             CREATE TABLE test (

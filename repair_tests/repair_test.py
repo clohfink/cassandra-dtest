@@ -1,16 +1,18 @@
 import threading
 import time
+import re
 from collections import namedtuple
-from unittest import skip
+from threading import Thread
+from unittest import skip, skipIf
 
 from cassandra import ConsistencyLevel
 from cassandra.query import SimpleStatement
-
-from dtest import FlakyRetryPolicy, Tester, debug
-from tools.data import insert_c1c2, query_c1c2
-from tools.decorators import known_failure, no_vnodes, since
-from threading import Thread
 from ccmlib.node import ToolError
+from nose.plugins.attrib import attr
+
+from dtest import CASSANDRA_VERSION_FROM_BUILD, FlakyRetryPolicy, Tester, debug, create_ks, create_cf
+from tools.data import insert_c1c2, query_c1c2
+from tools.decorators import no_vnodes, since
 
 
 def _repair_options(version, ks='', cf=None, sequential=True):
@@ -92,10 +94,9 @@ class BaseRepairTest(Tester):
         cluster.populate(3).start()
         node1, node2, node3 = cluster.nodelist()
 
-        session = self.patient_cql_connection(node1)
-        session.cluster.default_retry_policy = FlakyRetryPolicy(max_retries=15)
-        self.create_ks(session, 'ks', 3)
-        self.create_cf(session, 'cf', read_repair=0.0, columns={'c1': 'text', 'c2': 'text'})
+        session = self.patient_cql_connection(node1, retry_policy=FlakyRetryPolicy(max_retries=15))
+        create_ks(session, 'ks', 3)
+        create_cf(session, 'cf', read_repair=0.0, columns={'c1': 'text', 'c2': 'text'})
 
         # Insert 1000 keys, kill node 3, insert 1 key, restart node 3, insert 1000 more keys
         debug("Inserting data...")
@@ -151,7 +152,7 @@ class BaseRepairTest(Tester):
 class TestRepair(BaseRepairTest):
     __test__ = True
 
-    @since('2.2.1')
+    @since('2.2.1', '4')
     def no_anticompaction_after_dclocal_repair_test(self):
         """
         * Launch a four node, two DC cluster
@@ -179,12 +180,10 @@ class TestRepair(BaseRepairTest):
         for node in cluster.nodelist():
             self.assertFalse(node.grep_log("Starting anticompaction"))
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-12578',
-                   flaky=True)
+    @skipIf(CASSANDRA_VERSION_FROM_BUILD == '3.9', "Test doesn't run on 3.9")
     def nonexistent_table_repair_test(self):
         """
-        * Check that repairing a non-existant table fails
+        * Check that repairing a non-existent table fails
         @jira_ticket CASSANDRA-12279
         """
         self.ignore_log_patterns = [r'Unknown keyspace/cf pair']
@@ -222,7 +221,7 @@ class TestRepair(BaseRepairTest):
             self.assertTrue('Unknown keyspace/cf pair' in nodetool_error.message,
                             'Repair thread on inexistent table did not detect inexistent table.')
 
-    @since('2.2.1')
+    @since('2.2.1', '4')
     def no_anticompaction_after_hostspecific_repair_test(self):
         """
         * Launch a four node, two DC cluster
@@ -243,7 +242,7 @@ class TestRepair(BaseRepairTest):
         for node in cluster.nodelist():
             self.assertFalse(node.grep_log("Starting anticompaction"))
 
-    @since('2.2.4')
+    @since('2.2.4', '4')
     def no_anticompaction_after_subrange_repair_test(self):
         """
         * Launch a three node, two DC cluster
@@ -264,7 +263,64 @@ class TestRepair(BaseRepairTest):
         for node in cluster.nodelist():
             self.assertFalse(node.grep_log("Starting anticompaction"))
 
-    @since('2.2.1')
+    def _get_repaired_data(self, node, keyspace):
+        """
+        Based on incremental_repair_test.py:TestIncRepair implementation.
+        """
+        _sstable_name = re.compile('SSTable: (.+)')
+        _repaired_at = re.compile('Repaired at: (\d+)')
+        _sstable_data = namedtuple('_sstabledata', ('name', 'repaired'))
+
+        out = node.run_sstablemetadata(keyspace=keyspace).stdout
+
+        def matches(pattern):
+            return filter(None, [pattern.match(l) for l in out.split('\n')])
+
+        names = [m.group(1) for m in matches(_sstable_name)]
+        repaired_times = [int(m.group(1)) for m in matches(_repaired_at)]
+
+        self.assertTrue(names)
+        self.assertTrue(repaired_times)
+        return [_sstable_data(*a) for a in zip(names, repaired_times)]
+
+    @since('2.2.10', '4')
+    def no_anticompaction_of_already_repaired_test(self):
+        """
+        * Launch three node cluster and stress with RF2
+        * Do incremental repair to have all sstables flagged as repaired
+        * Stop node2, stress, start again and run full -pr repair
+        * Verify that none of the already repaired sstables have been anti-compacted again
+        @jira_ticket CASSANDRA-13153
+        """
+
+        cluster = self.cluster
+        debug("Starting cluster..")
+        # disable JBOD conf since the test expects sstables to be on the same disk
+        cluster.set_datadir_count(1)
+        cluster.populate(3).start(wait_for_binary_proto=True)
+        node1, node2, node3 = cluster.nodelist()
+        # we use RF to make sure to cover only a set of sub-ranges when doing -full -pr
+        node1.stress(stress_options=['write', 'n=50K', 'no-warmup', 'cl=ONE', '-schema', 'replication(factor=2)', '-rate', 'threads=50'])
+        # disable compaction to make sure that we won't create any new sstables with repairedAt 0
+        node1.nodetool('disableautocompaction keyspace1 standard1')
+        # Do incremental repair of all ranges. All sstables are expected for have repairedAt set afterwards.
+        node1.nodetool("repair keyspace1 standard1")
+        meta = self._get_repaired_data(node1, 'keyspace1')
+        repaired = set([m for m in meta if m.repaired > 0])
+        self.assertEquals(len(repaired), len(meta))
+
+        # stop node2, stress and start full repair to find out how synced ranges affect repairedAt values
+        node2.stop(wait_other_notice=True)
+        node1.stress(stress_options=['write', 'n=40K', 'no-warmup', 'cl=ONE', '-rate', 'threads=50'])
+        node2.start(wait_for_binary_proto=True, wait_other_notice=True)
+        node1.nodetool("repair -full -pr keyspace1 standard1")
+
+        meta = self._get_repaired_data(node1, 'keyspace1')
+        repairedAfterFull = set([m for m in meta if m.repaired > 0])
+        # already repaired sstables must remain untouched
+        self.assertEquals(repaired.intersection(repairedAfterFull), repaired)
+
+    @since('2.2.1', '4')
     def anticompaction_after_normal_repair_test(self):
         """
         * Launch a four node, two DC cluster
@@ -281,20 +337,12 @@ class TestRepair(BaseRepairTest):
         for node in cluster.nodelist():
             self.assertTrue("Starting anticompaction")
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-12162',
-                   flaky=True,
-                   notes='windows')
     def simple_sequential_repair_test(self):
         """
         Calls simple repair test with a sequential repair
         """
         self._simple_repair(sequential=True)
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11247',
-                   flaky=True,
-                   notes='windows')
     def simple_parallel_repair_test(self):
         """
         Calls simple repair test with a parallel repair
@@ -401,7 +449,7 @@ class TestRepair(BaseRepairTest):
 
         session = self.patient_cql_connection(node1)
         # create keyspace with RF=2 to be able to be repaired
-        self.create_ks(session, 'ks', 2)
+        create_ks(session, 'ks', 2)
         # we create two tables, one has low gc grace seconds so that the data
         # can be dropped during test (but we don't actually drop them).
         # the other has default gc.
@@ -526,7 +574,7 @@ class TestRepair(BaseRepairTest):
 
         session = self.patient_cql_connection(node1)
         # create keyspace with RF=2 to be able to be repaired
-        self.create_ks(session, 'ks', 2)
+        create_ks(session, 'ks', 2)
         query = """
             CREATE TABLE IF NOT EXISTS table1 (
                 c1 text,
@@ -605,10 +653,6 @@ class TestRepair(BaseRepairTest):
         # Check node2 now has the key
         self.check_rows_on_node(node2, 2001, found=[1000], restart=False)
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11605',
-                   flaky=True,
-                   notes='flaky on Windows')
     def dc_parallel_repair_test(self):
         """
         * Set up a multi DC cluster
@@ -664,7 +708,7 @@ class TestRepair(BaseRepairTest):
         session = self.patient_cql_connection(node1)
         session.execute("CREATE KEYSPACE ks WITH replication = {'class': 'NetworkTopologyStrategy', 'dc1': 2, 'dc2': 1, 'dc3':1}")
         session.execute("USE ks")
-        self.create_cf(session, 'cf', read_repair=0.0, columns={'c1': 'text', 'c2': 'text'})
+        create_cf(session, 'cf', read_repair=0.0, columns={'c1': 'text', 'c2': 'text'})
 
         # Insert 1000 keys, kill node 2, insert 1 key, restart node 2, insert 1000 more keys
         debug("Inserting data...")
@@ -942,10 +986,6 @@ class TestRepair(BaseRepairTest):
                       rows[0][0],
                       'Expected {} job threads in repair options. Instead we saw {}'.format(job_thread_count, rows[0][0]))
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11836',
-                   flaky=True,
-                   notes='Windows')
     @since('2.2')
     def thread_count_repair_test(self):
         """
@@ -1052,12 +1092,122 @@ class TestRepair(BaseRepairTest):
         else:
             node1.nodetool('repair keyspace1 standard1 -inc -par')
 
+    @since('2.2')
+    def test_dead_sync_initiator(self):
+        """
+        @jira_ticket CASSANDRA-12901
+        """
+        self._test_failure_during_repair(phase='sync', initiator=True)
+
+    @since('2.2')
+    def test_dead_sync_participant(self):
+        """
+        @jira_ticket CASSANDRA-12901
+        """
+        self._test_failure_during_repair(phase='sync', initiator=False,)
+
+    @since('2.2', '4')
+    def test_failure_during_anticompaction(self):
+        """
+        @jira_ticket CASSANDRA-12901
+        """
+        self._test_failure_during_repair(phase='anticompaction',)
+
+    @since('2.2')
+    def test_failure_during_validation(self):
+        """
+        @jira_ticket CASSANDRA-12901
+        """
+        self._test_failure_during_repair(phase='validation')
+
+    def _test_failure_during_repair(self, phase, initiator=False):
+        cluster = self.cluster
+        # We are not interested in specific errors, but
+        # that the repair session finishes on node failure without hanging
+        self.ignore_log_patterns = [
+            "Endpoint .* died",
+            "Streaming error occurred",
+            "StreamReceiveTask",
+            "Stream failed",
+            "Session completed with the following error",
+            "Repair session .* for range .* failed with error",
+            "Sync failed between .* and .*"
+        ]
+
+        # Disable hinted handoff and set batch commit log so this doesn't
+        # interfere with the test (this must be after the populate)
+        cluster.set_configuration_options(values={'hinted_handoff_enabled': False})
+        cluster.set_batch_commitlog(enabled=True)
+        debug("Setting up cluster..")
+        cluster.populate(3)
+        node1, node2, node3 = cluster.nodelist()
+
+        node_to_kill = node2 if (phase == 'sync' and initiator) else node3
+        debug("Setting up byteman on {}".format(node_to_kill.name))
+        # set up byteman
+        node_to_kill.byteman_port = '8100'
+        node_to_kill.import_config_files()
+
+        debug("Starting cluster..")
+        cluster.start(wait_other_notice=True)
+
+        debug("stopping node3")
+        node3.stop(gently=False, wait_other_notice=True)
+
+        self.patient_exclusive_cql_connection(node1)
+        debug("inserting data while node3 is down")
+        node1.stress(stress_options=['write', 'n=1k',
+                                     'no-warmup', 'cl=ONE',
+                                     '-schema', 'replication(factor=3)',
+                                     '-rate', 'threads=10'])
+
+        debug("bring back node3")
+        node3.start(wait_other_notice=True, wait_for_binary_proto=True)
+
+        script = 'stream_sleep.btm' if phase == 'sync' else 'repair_{}_sleep.btm'.format(phase)
+        debug("Submitting byteman script to {}".format(node_to_kill.name))
+        # Sleep on anticompaction/stream so there will be time for node to be killed
+        node_to_kill.byteman_submit(['./byteman/{}'.format(script)])
+
+        def node1_repair():
+            global nodetool_error
+            try:
+                node1.nodetool('repair keyspace1 standard1')
+            except Exception, e:
+                nodetool_error = e
+
+        debug("repair node1")
+        # Launch in a external thread so it does not hang process
+        t = Thread(target=node1_repair)
+        t.start()
+
+        debug("Will kill {} in middle of {}".format(node_to_kill.name, phase))
+        msg_to_wait = 'streaming plan for Repair'
+        if phase == 'anticompaction':
+            msg_to_wait = 'Got anticompaction request'
+        elif phase == 'validation':
+            msg_to_wait = 'Validating'
+        node_to_kill.watch_log_for(msg_to_wait, filename='debug.log')
+        node_to_kill.stop(gently=False, wait_other_notice=True)
+
+        debug("Killed {}, now waiting repair to finish".format(node_to_kill.name))
+        t.join(timeout=60)
+        self.assertFalse(t.isAlive(), 'Repair still running after sync {} was killed'
+                                      .format("initiator" if initiator else "participant"))
+
+        if cluster.version() < '4.0' or phase != 'sync':
+            # the log entry we're watching for in the sync task came from the
+            # anti compaction at the end of the repair, which has been removed in 4.0
+            node1.watch_log_for('Endpoint .* died', timeout=60)
+        node1.watch_log_for('Repair command .* finished', timeout=60)
+
 
 RepairTableContents = namedtuple('RepairTableContents',
                                  ['parent_repair_history', 'repair_history'])
 
 
 @since('2.2')
+@attr("resource-intensive")
 class TestRepairDataSystemTable(Tester):
     """
     @jira_ticket CASSANDRA-5839
@@ -1131,10 +1281,6 @@ class TestRepairDataSystemTable(Tester):
         parent_repair_history, _ = self.repair_table_contents(node=self.node1, include_system_keyspaces=False)
         self.assertTrue(len(parent_repair_history))
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11298',
-                   flaky=True,
-                   notes='windows')
     def repair_table_test(self):
         """
         Test that `system_distributed.repair_history` is properly populated

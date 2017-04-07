@@ -3,14 +3,9 @@ import time
 from unittest import skip
 
 from dtest import Tester
-from tools.decorators import known_failure
 
 
 class TestMetadata(Tester):
-
-    def __init__(self, *args, **kwargs):
-        kwargs['cluster_options'] = {'start_rpc': 'true'}
-        Tester.__init__(self, *args, **kwargs)
 
     def force_compact(self):
         cluster = self.cluster
@@ -29,10 +24,6 @@ class TestMetadata(Tester):
         node1.stress(['read', 'no-warmup', 'n=30000', '-schema', 'replication(factor=2)', 'compression=LZ4Compressor',
                       '-rate', 'threads=1'])
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11095',
-                   flaky=True,
-                   notes='hangs CI on 2.0+')
     @skip('hangs CI')
     def metadata_reset_while_compact_test(self):
         """

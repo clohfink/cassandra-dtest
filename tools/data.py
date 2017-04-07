@@ -6,10 +6,11 @@ from cassandra.query import SimpleStatement
 from nose.tools import assert_equal, assert_true
 
 import assertions
+from dtest import create_cf
 
 
 def create_c1c2_table(tester, session, read_repair=None):
-    tester.create_cf(session, 'cf', columns={'c1': 'text', 'c2': 'text'}, read_repair=read_repair)
+    create_cf(session, 'cf', columns={'c1': 'text', 'c2': 'text'}, read_repair=read_repair)
 
 
 def insert_c1c2(session, keys=None, n=None, consistency=ConsistencyLevel.QUORUM):
@@ -141,3 +142,10 @@ def get_table_metadata(session, keyspace_name, table_name):
 def rows_to_list(rows):
     new_list = [list(row) for row in rows]
     return new_list
+
+
+def index_is_built(node, session, keyspace, table_name, idx_name):
+    # checks if an index has been built
+    full_idx_name = idx_name if node.get_cassandra_version() > '3.0' else '{}.{}'.format(table_name, idx_name)
+    index_query = """SELECT * FROM system."IndexInfo" WHERE table_name = '{}' AND index_name = '{}'""".format(keyspace, full_idx_name)
+    return len(list(session.execute(index_query))) == 1

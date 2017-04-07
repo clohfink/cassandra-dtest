@@ -8,9 +8,9 @@ import uuid
 import parse
 from ccmlib import common
 
-from dtest import Tester, debug
+from dtest import Tester, debug, create_ks, create_cf
 from tools.assertions import assert_length_equal, assert_stderr_clean
-from tools.decorators import known_failure, since
+from tools.decorators import since
 
 KEYSPACE = 'ks'
 
@@ -184,7 +184,7 @@ class TestScrubIndexes(TestHelper):
 
     def create_users(self, session):
         columns = {"password": "varchar", "gender": "varchar", "session_token": "varchar", "state": "varchar", "birth_year": "bigint"}
-        self.create_cf(session, 'users', columns=columns)
+        create_cf(session, 'users', columns=columns)
 
         session.execute("CREATE INDEX gender_idx ON users (gender)")
         session.execute("CREATE INDEX state_idx ON users (state)")
@@ -212,17 +212,13 @@ class TestScrubIndexes(TestHelper):
         assert_length_equal(ret, 8)
         return ret
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11284',
-                   flaky=True,
-                   notes='windows')
     def test_scrub_static_table(self):
         cluster = self.cluster
         cluster.populate(1).start()
         node1 = cluster.nodelist()[0]
 
         session = self.patient_cql_connection(node1)
-        self.create_ks(session, KEYSPACE, 1)
+        create_ks(session, KEYSPACE, 1)
 
         self.create_users(session)
         self.update_users(session)
@@ -255,20 +251,13 @@ class TestScrubIndexes(TestHelper):
         users = self.query_users(session)
         self.assertEqual(initial_users, users)
 
-    @known_failure(failure_source='cassandra',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-12337',
-                   flaky=True)
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11236',
-                   flaky=False,
-                   notes='windows')
     def test_standalone_scrub(self):
         cluster = self.cluster
         cluster.populate(1).start()
         node1 = cluster.nodelist()[0]
 
         session = self.patient_cql_connection(node1)
-        self.create_ks(session, KEYSPACE, 1)
+        create_ks(session, KEYSPACE, 1)
 
         self.create_users(session)
         self.update_users(session)
@@ -289,17 +278,13 @@ class TestScrubIndexes(TestHelper):
         users = self.query_users(session)
         self.assertEqual(initial_users, users)
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11284',
-                   flaky=True,
-                   notes='windows')
     def test_scrub_collections_table(self):
         cluster = self.cluster
         cluster.populate(1).start()
         node1 = cluster.nodelist()[0]
 
         session = self.patient_cql_connection(node1)
-        self.create_ks(session, KEYSPACE, 1)
+        create_ks(session, KEYSPACE, 1)
 
         session.execute("CREATE TABLE users (user_id uuid PRIMARY KEY, email text, uuids list<uuid>)")
         session.execute("CREATE INDEX user_uuids_idx on users (uuids)")
@@ -340,7 +325,7 @@ class TestScrub(TestHelper):
 
     def create_users(self, session):
         columns = {"password": "varchar", "gender": "varchar", "session_token": "varchar", "state": "varchar", "birth_year": "bigint"}
-        self.create_cf(session, 'users', columns=columns)
+        create_cf(session, 'users', columns=columns)
 
     def update_users(self, session):
         session.execute("INSERT INTO users (KEY, password, gender, state, birth_year) VALUES ('user1', 'ch@ngem3a', 'f', 'TX', 1978)")
@@ -361,10 +346,6 @@ class TestScrub(TestHelper):
         assert_length_equal(ret, 5)
         return ret
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11284',
-                   flaky=True,
-                   notes='windows')
     def test_nodetool_scrub(self):
         cluster = self.cluster
         cluster.populate(1).start()
@@ -374,7 +355,7 @@ class TestScrub(TestHelper):
         node1.nodetool('disableautocompaction')
 
         session = self.patient_cql_connection(node1)
-        self.create_ks(session, KEYSPACE, 1)
+        create_ks(session, KEYSPACE, 1)
 
         self.create_users(session)
         self.update_users(session)
@@ -407,17 +388,13 @@ class TestScrub(TestHelper):
         users = self.query_users(session)
         self.assertEqual(initial_users, users)
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11236',
-                   flaky=False,
-                   notes='windows')
     def test_standalone_scrub(self):
         cluster = self.cluster
         cluster.populate(1).start()
         node1 = cluster.nodelist()[0]
 
         session = self.patient_cql_connection(node1)
-        self.create_ks(session, KEYSPACE, 1)
+        create_ks(session, KEYSPACE, 1)
 
         self.create_users(session)
         self.update_users(session)
@@ -438,17 +415,13 @@ class TestScrub(TestHelper):
         users = self.query_users(session)
         self.assertEqual(initial_users, users)
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11240',
-                   flaky=False,
-                   notes='windows')
     def test_standalone_scrub_essential_files_only(self):
         cluster = self.cluster
         cluster.populate(1).start()
         node1 = cluster.nodelist()[0]
 
         session = self.patient_cql_connection(node1)
-        self.create_ks(session, KEYSPACE, 1)
+        create_ks(session, KEYSPACE, 1)
 
         self.create_users(session)
         self.update_users(session)

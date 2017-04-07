@@ -1,7 +1,7 @@
 import os
 import os.path
 
-from dtest import DISABLE_VNODES, Tester
+from dtest import DISABLE_VNODES, Tester, create_ks
 from tools.assertions import assert_almost_equal
 from tools.data import create_c1c2_table, insert_c1c2, query_c1c2
 from tools.decorators import since
@@ -18,13 +18,12 @@ class TestDiskBalance(Tester):
 
     def disk_balance_stress_test(self):
         cluster = self.cluster
-        cluster.set_configuration_options(values={'allocate_tokens_for_keyspace': 'keyspace1'})
         if not DISABLE_VNODES:
             cluster.set_configuration_options(values={'num_tokens': 256})
         cluster.populate(4).start(wait_for_binary_proto=True)
         node1 = cluster.nodes['node1']
 
-        node1.stress(['write', 'n=10k', 'no-warmup', '-rate', 'threads=100', '-schema', 'replication(factor=2)'])
+        node1.stress(['write', 'n=50k', 'no-warmup', '-rate', 'threads=100', '-schema', 'replication(factor=3)', 'compaction(strategy=SizeTieredCompactionStrategy,enabled=false)'])
         cluster.flush()
         # make sure the data directories are balanced:
         for node in cluster.nodelist():
@@ -36,7 +35,6 @@ class TestDiskBalance(Tester):
             cluster.set_configuration_options(values={'num_tokens': 256})
         # apparently we have legitimate errors in the log when bootstrapping (see bootstrap_test.py)
         self.allow_log_errors = True
-        cluster.set_configuration_options(values={'allocate_tokens_for_keyspace': 'keyspace1'})
         cluster.populate(4).start(wait_for_binary_proto=True)
         node1 = cluster.nodes['node1']
 
@@ -50,7 +48,6 @@ class TestDiskBalance(Tester):
         cluster = self.cluster
         if not DISABLE_VNODES:
             cluster.set_configuration_options(values={'num_tokens': 256})
-        cluster.set_configuration_options(values={'allocate_tokens_for_keyspace': 'keyspace1'})
         cluster.populate(4).start(wait_for_binary_proto=True)
         node1 = cluster.nodes['node1']
         node4 = cluster.nodes['node4']
@@ -74,7 +71,7 @@ class TestDiskBalance(Tester):
         cluster.start(wait_for_binary_proto=True)
 
         session = self.patient_cql_connection(node)
-        self.create_ks(session, 'ks', 1)
+        create_ks(session, 'ks', 1)
         create_c1c2_table(self, session)
         insert_c1c2(session, n=10000)
         node.flush()
@@ -98,7 +95,6 @@ class TestDiskBalance(Tester):
         cluster = self.cluster
         if not DISABLE_VNODES:
             cluster.set_configuration_options(values={'num_tokens': 256})
-        cluster.set_configuration_options(values={'allocate_tokens_for_keyspace': 'keyspace1'})
         cluster.populate(3).start(wait_for_binary_proto=True)
         node1 = cluster.nodes['node1']
         node1.stress(['write', 'n=1', 'no-warmup', '-rate', 'threads=100', '-schema', 'replication(factor=1)'])

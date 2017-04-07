@@ -29,18 +29,20 @@ from cassandra import ConsistencyLevel
 from cassandra.auth import PlainTextAuthProvider
 from cassandra.cluster import Cluster as PyCluster
 from cassandra.cluster import NoHostAvailable
+from cassandra.cluster import ExecutionProfile, EXEC_PROFILE_DEFAULT
 from cassandra.policies import RetryPolicy, WhiteListRoundRobinPolicy
 from ccmlib.cluster import Cluster
 from ccmlib.cluster_factory import ClusterFactory
 from ccmlib.common import get_version_from_build, is_win
-from ccmlib.node import TimeoutError
 from nose.exc import SkipTest
+from nose.tools import assert_greater_equal
 from six import print_
 
 from plugins.dtestconfig import _CONFIG as CONFIG
 # We don't want test files to know about the plugins module, so we import
 # constants here and re-export them.
 from plugins.dtestconfig import GlobalConfigObject
+from tools.context import log_filter
 from tools.funcutils import merge_dicts
 
 LOG_SAVED_DIR = "logs"
@@ -70,7 +72,6 @@ OFFHEAP_MEMTABLES = os.environ.get('OFFHEAP_MEMTABLES', '').lower() in ('yes', '
 NUM_TOKENS = os.environ.get('NUM_TOKENS', '256')
 RECORD_COVERAGE = os.environ.get('RECORD_COVERAGE', '').lower() in ('yes', 'true')
 REUSE_CLUSTER = os.environ.get('REUSE_CLUSTER', '').lower() in ('yes', 'true')
-SILENCE_DRIVER_ON_SHUTDOWN = os.environ.get('SILENCE_DRIVER_ON_SHUTDOWN', 'true').lower() in ('yes', 'true')
 IGNORE_REQUIRE = os.environ.get('IGNORE_REQUIRE', '').lower() in ('yes', 'true')
 DATADIR_COUNT = os.environ.get('DATADIR_COUNT', '3')
 ENABLE_ACTIVE_LOG_WATCHING = os.environ.get('ENABLE_ACTIVE_LOG_WATCHING', '').lower() in ('yes', 'true')
@@ -104,19 +105,13 @@ LOG = logging.getLogger('dtest')
 logging.getLogger('cassandra').setLevel(logging.INFO)
 
 
-def index_is_built(node, session, keyspace, table_name, idx_name):
-    # checks if an index has been built
-    full_idx_name = idx_name if node.get_cassandra_version() > '3.0' else '{}.{}'.format(table_name, idx_name)
-    index_query = """SELECT * FROM system."IndexInfo" WHERE table_name = '{}' AND index_name = '{}'""".format(keyspace, full_idx_name)
-    return len(list(session.execute(index_query))) == 1
-
-
 def get_sha(repo_dir):
     try:
         output = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=repo_dir).strip()
-        prefix = 'git:'
-        if os.environ.get('LOCAL_GIT_REPO') is not None:
-            prefix = 'local:'
+        prefix = 'github:apache/'
+        local_repo_location = os.environ.get('LOCAL_GIT_REPO')
+        if local_repo_location is not None:
+            prefix = 'local:{}:'.format(local_repo_location)  # local: slugs take the form 'local:/some/path/to/cassandra/:branch_name_or_sha'
         return "{}{}".format(prefix, output)
     except CalledProcessError as e:
         if re.search('Not a git repository', e.message) is not None:
@@ -167,28 +162,8 @@ def find_libjemalloc():
         print "Failed to run script to prelocate libjemalloc ({}): {}".format(script, exc)
         return ""
 
+
 CASSANDRA_LIBJEMALLOC = find_libjemalloc()
-
-
-class expect_control_connection_failures(object):
-    """
-    We're just using a class here as a one-off object with a filter method, for
-    use as a filter object in the driver logger. It's frustrating that we can't
-    just pass in a function, but we need an object with a .filter method. Oh
-    well, I guess that's what old stdlib libraries are like.
-    """
-    @staticmethod
-    def filter(record):
-        expected_strings = [
-            'Control connection failed to connect, shutting down Cluster:',
-            '[control connection] Error connecting to '
-        ]
-        for s in expected_strings:
-            if s in record.msg or s in record.name:
-                return False
-        return True
-
-
 # copy the initial environment variables so we can reset them later:
 initial_environment = copy.deepcopy(os.environ)
 
@@ -212,6 +187,7 @@ def debug(msg):
     LOG.debug(msg, extra={"current_test": CURRENT_TEST})
     if PRINT_DEBUG:
         print msg
+
 
 debug("Python driver version in use: {}".format(cassandra.__version__))
 
@@ -295,15 +271,17 @@ class Runner(threading.Thread):
             raise self.__error
 
 
+def make_execution_profile(retry_policy=FlakyRetryPolicy(), consistency_level=ConsistencyLevel.ONE, **kwargs):
+    return ExecutionProfile(retry_policy=retry_policy,
+                            consistency_level=consistency_level,
+                            **kwargs)
+
+
 class Tester(TestCase):
 
     maxDiff = None
-
-    def __init__(self, *argv, **kwargs):
-        # if False, then scan the log of each node for errors after every test.
-        self.allow_log_errors = False
-        self.cluster_options = kwargs.pop('cluster_options', None)
-        super(Tester, self).__init__(*argv, **kwargs)
+    allow_log_errors = False  # scan the log of each node for errors after every test.
+    cluster_options = None
 
     def set_node_to_current_version(self, node):
         version = os.environ.get('CASSANDRA_VERSION')
@@ -463,71 +441,58 @@ class Tester(TestCase):
             if not is_win():
                 os.symlink(basedir, name)
 
-    def get_eager_protocol_version(self, cassandra_version):
-        """
-        Returns the highest protocol version accepted
-        by the given C* version
-        """
-        if cassandra_version >= '2.2':
-            protocol_version = 4
-        elif cassandra_version >= '2.1':
-            protocol_version = 3
-        elif cassandra_version >= '2.0':
-            protocol_version = 2
-        else:
-            protocol_version = 1
-        return protocol_version
-
     def cql_connection(self, node, keyspace=None, user=None,
-                       password=None, compression=True, protocol_version=None, port=None, ssl_opts=None):
+                       password=None, compression=True, protocol_version=None, port=None, ssl_opts=None, **kwargs):
 
         return self._create_session(node, keyspace, user, password, compression,
-                                    protocol_version, port=port, ssl_opts=ssl_opts)
+                                    protocol_version, port=port, ssl_opts=ssl_opts, **kwargs)
 
     def exclusive_cql_connection(self, node, keyspace=None, user=None,
-                                 password=None, compression=True, protocol_version=None, port=None, ssl_opts=None):
+                                 password=None, compression=True, protocol_version=None, port=None, ssl_opts=None, **kwargs):
 
-        node_ip = self.get_ip_from_node(node)
+        node_ip = get_ip_from_node(node)
         wlrr = WhiteListRoundRobinPolicy([node_ip])
 
         return self._create_session(node, keyspace, user, password, compression,
-                                    protocol_version, wlrr, port=port, ssl_opts=ssl_opts)
+                                    protocol_version, port=port, ssl_opts=ssl_opts, load_balancing_policy=wlrr, **kwargs)
 
-    def _create_session(self, node, keyspace, user, password, compression, protocol_version, load_balancing_policy=None,
-                        port=None, ssl_opts=None):
-        node_ip = self.get_ip_from_node(node)
+    def _create_session(self, node, keyspace, user, password, compression, protocol_version,
+                        port=None, ssl_opts=None, execution_profiles=None, **kwargs):
+        node_ip = get_ip_from_node(node)
         if not port:
-            port = self.get_port_from_node(node)
+            port = get_port_from_node(node)
 
         if protocol_version is None:
-            protocol_version = self.get_eager_protocol_version(self.cluster.version())
+            protocol_version = get_eager_protocol_version(node.cluster.version())
 
         if user is not None:
-            auth_provider = self.get_auth_provider(user=user, password=password)
+            auth_provider = get_auth_provider(user=user, password=password)
         else:
             auth_provider = None
 
-        cluster = PyCluster([node_ip], auth_provider=auth_provider, compression=compression,
-                            protocol_version=protocol_version, load_balancing_policy=load_balancing_policy, default_retry_policy=FlakyRetryPolicy(),
-                            port=port, ssl_options=ssl_opts, connect_timeout=10, allow_beta_protocol_version=True)
-        session = cluster.connect(wait_for_all_pools=True)
+        profiles = {EXEC_PROFILE_DEFAULT: make_execution_profile(**kwargs)
+                    } if not execution_profiles else execution_profiles
 
-        # temporarily increase client-side timeout to 1m to determine
-        # if the cluster is simply responding slowly to requests
-        session.default_timeout = 60.0
+        cluster = PyCluster([node_ip],
+                            auth_provider=auth_provider,
+                            compression=compression,
+                            protocol_version=protocol_version,
+                            port=port,
+                            ssl_options=ssl_opts,
+                            connect_timeout=10,
+                            allow_beta_protocol_version=True,
+                            execution_profiles=profiles)
+        session = cluster.connect(wait_for_all_pools=True)
 
         if keyspace is not None:
             session.set_keyspace(keyspace)
-
-        # override driver default consistency level of LOCAL_QUORUM
-        session.default_consistency_level = ConsistencyLevel.ONE
 
         self.connections.append(session)
         return session
 
     def patient_cql_connection(self, node, keyspace=None,
                                user=None, password=None, timeout=30, compression=True,
-                               protocol_version=None, port=None, ssl_opts=None):
+                               protocol_version=None, port=None, ssl_opts=None, **kwargs):
         """
         Returns a connection after it stops throwing NoHostAvailables due to not being ready.
 
@@ -536,8 +501,8 @@ class Tester(TestCase):
         if is_win():
             timeout *= 2
 
-        logging.getLogger('cassandra.cluster').addFilter(expect_control_connection_failures)
-        try:
+        expected_log_lines = ('Control connection failed to connect, shutting down Cluster:', '[control connection] Error connecting to ')
+        with log_filter('cassandra.cluster', expected_log_lines):
             session = retry_till_success(
                 self.cql_connection,
                 node,
@@ -549,16 +514,15 @@ class Tester(TestCase):
                 protocol_version=protocol_version,
                 port=port,
                 ssl_opts=ssl_opts,
-                bypassed_exception=NoHostAvailable
+                bypassed_exception=NoHostAvailable,
+                **kwargs
             )
-        finally:
-            logging.getLogger('cassandra.cluster').removeFilter(expect_control_connection_failures)
 
         return session
 
     def patient_exclusive_cql_connection(self, node, keyspace=None,
                                          user=None, password=None, timeout=30, compression=True,
-                                         protocol_version=None, port=None, ssl_opts=None):
+                                         protocol_version=None, port=None, ssl_opts=None, **kwargs):
         """
         Returns a connection after it stops throwing NoHostAvailables due to not being ready.
 
@@ -578,53 +542,9 @@ class Tester(TestCase):
             protocol_version=protocol_version,
             port=port,
             ssl_opts=ssl_opts,
-            bypassed_exception=NoHostAvailable
+            bypassed_exception=NoHostAvailable,
+            **kwargs
         )
-
-    def create_ks(self, session, name, rf):
-        query = 'CREATE KEYSPACE %s WITH replication={%s}'
-        if isinstance(rf, types.IntType):
-            # we assume simpleStrategy
-            session.execute(query % (name, "'class':'SimpleStrategy', 'replication_factor':%d" % rf))
-        else:
-            self.assertGreaterEqual(len(rf), 0, "At least one datacenter/rf pair is needed")
-            # we assume networkTopologyStrategy
-            options = (', ').join(['\'%s\':%d' % (d, r) for d, r in rf.iteritems()])
-            session.execute(query % (name, "'class':'NetworkTopologyStrategy', %s" % options))
-        session.execute('USE {}'.format(name))
-
-    # We default to UTF8Type because it's simpler to use in tests
-    def create_cf(self, session, name, key_type="varchar", speculative_retry=None, read_repair=None, compression=None,
-                  gc_grace=None, columns=None, validation="UTF8Type", compact_storage=False):
-
-        additional_columns = ""
-        if columns is not None:
-            for k, v in columns.items():
-                additional_columns = "{}, {} {}".format(additional_columns, k, v)
-
-        if additional_columns == "":
-            query = 'CREATE COLUMNFAMILY %s (key %s, c varchar, v varchar, PRIMARY KEY(key, c)) WITH comment=\'test cf\'' % (name, key_type)
-        else:
-            query = 'CREATE COLUMNFAMILY %s (key %s PRIMARY KEY%s) WITH comment=\'test cf\'' % (name, key_type, additional_columns)
-
-        if compression is not None:
-            query = '%s AND compression = { \'sstable_compression\': \'%sCompressor\' }' % (query, compression)
-        else:
-            # if a compression option is omitted, C* will default to lz4 compression
-            query += ' AND compression = {}'
-
-        if read_repair is not None:
-            query = '%s AND read_repair_chance=%f AND dclocal_read_repair_chance=%f' % (query, read_repair, read_repair)
-        if gc_grace is not None:
-            query = '%s AND gc_grace_seconds=%d' % (query, gc_grace)
-        if speculative_retry is not None:
-            query = '%s AND speculative_retry=\'%s\'' % (query, speculative_retry)
-
-        if compact_storage:
-            query += ' AND COMPACT STORAGE'
-
-        session.execute(query)
-        time.sleep(0.2)
 
     @classmethod
     def tearDownClass(cls):
@@ -712,58 +632,9 @@ class Tester(TestCase):
             else:
                 yield e
 
-    def get_ip_from_node(self, node):
-        if node.network_interfaces['binary']:
-            node_ip = node.network_interfaces['binary'][0]
-        else:
-            node_ip = node.network_interfaces['thrift'][0]
-        return node_ip
-
-    def get_port_from_node(self, node):
-        """
-        Return the port that this node is listening on.
-        We only use this to connect the native driver,
-        so we only care about the binary port.
-        """
-        try:
-            return node.network_interfaces['binary'][1]
-        except Exception:
-            raise RuntimeError("No network interface defined on this node object. {}".format(node.network_interfaces))
-
-    def get_auth_provider(self, user, password):
-        return PlainTextAuthProvider(username=user, password=password)
-
-    def make_auth(self, user, password):
-        def private_auth(node_ip):
-            return {'username': user, 'password': password}
-        return private_auth
-
     # Disable docstrings printing in nosetest output
     def shortDescription(self):
         return None
-
-    def wait_for_any_log(self, nodes, pattern, timeout, filename='system.log'):
-        """
-        Look for a pattern in the system.log of any in a given list
-        of nodes.
-        @param nodes The list of nodes whose logs to scan
-        @param pattern The target pattern
-        @param timeout How long to wait for the pattern. Note that
-                        strictly speaking, timeout is not really a timeout,
-                        but a maximum number of attempts. This implies that
-                        the all the grepping takes no time at all, so it is
-                        somewhat inaccurate, but probably close enough.
-        @return The first node in whose log the pattern was found
-        """
-        for _ in range(timeout):
-            for node in nodes:
-                found = node.grep_log(pattern, filename=filename)
-                if found:
-                    return node
-            time.sleep(1)
-
-        raise TimeoutError(time.strftime("%d %b %Y %H:%M:%S", time.gmtime()) +
-                           " Unable to find: " + repr(pattern) + " in any node log within " + str(timeout) + "s")
 
     def get_jfr_jvm_args(self):
         """
@@ -797,6 +668,99 @@ class Tester(TestCase):
             debug(stderr)
 
 
+def get_eager_protocol_version(cassandra_version):
+    """
+    Returns the highest protocol version accepted
+    by the given C* version
+    """
+    if cassandra_version >= '2.2':
+        protocol_version = 4
+    elif cassandra_version >= '2.1':
+        protocol_version = 3
+    elif cassandra_version >= '2.0':
+        protocol_version = 2
+    else:
+        protocol_version = 1
+    return protocol_version
+
+
+# We default to UTF8Type because it's simpler to use in tests
+def create_cf(session, name, key_type="varchar", speculative_retry=None, read_repair=None, compression=None,
+              gc_grace=None, columns=None, validation="UTF8Type", compact_storage=False):
+
+    additional_columns = ""
+    if columns is not None:
+        for k, v in columns.items():
+            additional_columns = "{}, {} {}".format(additional_columns, k, v)
+
+    if additional_columns == "":
+        query = 'CREATE COLUMNFAMILY %s (key %s, c varchar, v varchar, PRIMARY KEY(key, c)) WITH comment=\'test cf\'' % (name, key_type)
+    else:
+        query = 'CREATE COLUMNFAMILY %s (key %s PRIMARY KEY%s) WITH comment=\'test cf\'' % (name, key_type, additional_columns)
+
+    if compression is not None:
+        query = '%s AND compression = { \'sstable_compression\': \'%sCompressor\' }' % (query, compression)
+    else:
+        # if a compression option is omitted, C* will default to lz4 compression
+        query += ' AND compression = {}'
+
+    if read_repair is not None:
+        query = '%s AND read_repair_chance=%f AND dclocal_read_repair_chance=%f' % (query, read_repair, read_repair)
+    if gc_grace is not None:
+        query = '%s AND gc_grace_seconds=%d' % (query, gc_grace)
+    if speculative_retry is not None:
+        query = '%s AND speculative_retry=\'%s\'' % (query, speculative_retry)
+
+    if compact_storage:
+        query += ' AND COMPACT STORAGE'
+
+    session.execute(query)
+    time.sleep(0.2)
+
+
+def create_ks(session, name, rf):
+    query = 'CREATE KEYSPACE %s WITH replication={%s}'
+    if isinstance(rf, types.IntType):
+        # we assume simpleStrategy
+        session.execute(query % (name, "'class':'SimpleStrategy', 'replication_factor':%d" % rf))
+    else:
+        assert_greater_equal(len(rf), 0, "At least one datacenter/rf pair is needed")
+        # we assume networkTopologyStrategy
+        options = (', ').join(['\'%s\':%d' % (d, r) for d, r in rf.iteritems()])
+        session.execute(query % (name, "'class':'NetworkTopologyStrategy', %s" % options))
+    session.execute('USE {}'.format(name))
+
+
+def get_auth_provider(user, password):
+    return PlainTextAuthProvider(username=user, password=password)
+
+
+def make_auth(user, password):
+    def private_auth(node_ip):
+        return {'username': user, 'password': password}
+    return private_auth
+
+
+def get_port_from_node(node):
+    """
+    Return the port that this node is listening on.
+    We only use this to connect the native driver,
+    so we only care about the binary port.
+    """
+    try:
+        return node.network_interfaces['binary'][1]
+    except Exception:
+        raise RuntimeError("No network interface defined on this node object. {}".format(node.network_interfaces))
+
+
+def get_ip_from_node(node):
+    if node.network_interfaces['binary']:
+        node_ip = node.network_interfaces['binary'][0]
+    else:
+        node_ip = node.network_interfaces['thrift'][0]
+    return node_ip
+
+
 def kill_windows_cassandra_procs():
     # On Windows, forcefully terminate any leftover previously running cassandra processes. This is a temporary
     # workaround until we can determine the cause of intermittent hung-open tests and file-handles.
@@ -827,6 +791,8 @@ def get_test_path():
         test_path = process.communicate()[0].rstrip()
 
     return test_path
+
+
 # nose will discover this as a test, so we manually make it not a test
 get_test_path.__test__ = False
 
@@ -856,39 +822,36 @@ def create_ccm_cluster(test_path, name):
 
 
 def cleanup_cluster(cluster, test_path, log_watch_thread=None):
-    if SILENCE_DRIVER_ON_SHUTDOWN:
-        # driver logging is very verbose when nodes start going down -- bump up the level
-        logging.getLogger('cassandra').setLevel(logging.CRITICAL)
+    with log_filter('cassandra'):  # quiet noise from driver when nodes start going down
+        if KEEP_TEST_DIR:
+            cluster.stop(gently=RECORD_COVERAGE)
+        else:
+            # when recording coverage the jvm has to exit normally
+            # or the coverage information is not written by the jacoco agent
+            # otherwise we can just kill the process
+            if RECORD_COVERAGE:
+                cluster.stop(gently=True)
 
-    if KEEP_TEST_DIR:
-        cluster.stop(gently=RECORD_COVERAGE)
-    else:
-        # when recording coverage the jvm has to exit normally
-        # or the coverage information is not written by the jacoco agent
-        # otherwise we can just kill the process
-        if RECORD_COVERAGE:
-            cluster.stop(gently=True)
+            # Cleanup everything:
+            try:
+                if log_watch_thread:
+                    stop_active_log_watch(log_watch_thread)
+            finally:
+                debug("removing ccm cluster {name} at: {path}".format(name=cluster.name, path=test_path))
+                cluster.remove()
 
-        # Cleanup everything:
-        try:
-            if log_watch_thread:
-                stop_active_log_watch(log_watch_thread)
-        finally:
-            debug("removing ccm cluster {name} at: {path}".format(name=cluster.name, path=test_path))
-            cluster.remove()
+                debug("clearing ssl stores from [{0}] directory".format(test_path))
+                for filename in ('keystore.jks', 'truststore.jks', 'ccm_node.cer'):
+                    try:
+                        os.remove(os.path.join(test_path, filename))
+                    except OSError as e:
+                        # once we port to py3, which has better reporting for exceptions raised while
+                        # handling other excpetions, we should just assert e.errno == errno.ENOENT
+                        if e.errno != errno.ENOENT:  # ENOENT = no such file or directory
+                            raise
 
-            debug("clearing ssl stores from [{0}] directory".format(test_path))
-            for filename in ('keystore.jks', 'truststore.jks', 'ccm_node.cer'):
-                try:
-                    os.remove(os.path.join(test_path, filename))
-                except OSError as e:
-                    # once we port to py3, which has better reporting for exceptions raised while
-                    # handling other excpetions, we should just assert e.errno == errno.ENOENT
-                    if e.errno != errno.ENOENT:  # ENOENT = no such file or directory
-                        raise
-
-            os.rmdir(test_path)
-            cleanup_last_test_dir()
+                os.rmdir(test_path)
+                cleanup_last_test_dir()
 
 
 def cleanup_last_test_dir():
@@ -938,6 +901,10 @@ def init_default_config(cluster, cluster_options):
             'truncate_request_timeout_in_ms': timeout,
             'request_timeout_in_ms': timeout
         })
+
+    # No more thrift in 4.0, and start_rpc doesn't exists anymore
+    if cluster.version() >= '4' and 'start_rpc' in values:
+        del values['start_rpc']
 
     cluster.set_configuration_options(values)
     debug("Done setting configuration options:\n" + pprint.pformat(cluster._config_options, indent=4))

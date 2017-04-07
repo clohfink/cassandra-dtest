@@ -3,7 +3,7 @@ from cassandra.policies import FallthroughRetryPolicy
 from cassandra.query import SimpleStatement
 
 from dtest import Tester
-from tools.decorators import known_failure, since
+from tools.decorators import since
 
 KEYSPACE = "readfailures"
 
@@ -13,14 +13,12 @@ class TestReadFailures(Tester):
     Tests for read failures in the replicas, introduced as a part of
     @jira_ticket CASSANDRA-12311.
     """
+    ignore_log_patterns = (
+        "Scanned over [1-9][0-9]* tombstones",  # This is expected when testing read failures due to tombstones
+    )
 
     def setUp(self):
         super(TestReadFailures, self).setUp()
-
-        self.ignore_log_patterns = [
-            "Scanned over [1-9][0-9]* tombstones"  # This is expected when testing read failures due to tombstones
-        ]
-
         self.tombstone_failure_threshold = 500
         self.replication_factor = 3
         self.consistency_level = ConsistencyLevel.ALL
@@ -44,24 +42,27 @@ class TestReadFailures(Tester):
             WITH replication = { 'class': 'SimpleStrategy', 'replication_factor': '%s' }
             """ % (KEYSPACE, self.replication_factor))
         session.set_keyspace(KEYSPACE)
-        session.execute("CREATE TABLE IF NOT EXISTS tombstonefailure (id int PRIMARY KEY, value text)")
+        session.execute("CREATE TABLE IF NOT EXISTS tombstonefailure (id int, c int, value text, primary key(id, c))")
 
         return session
 
     def _insert_tombstones(self, session, number_of_tombstones):
         for num_id in range(number_of_tombstones):
-            session.execute(SimpleStatement("DELETE value FROM tombstonefailure WHERE id = {}".format(num_id),
+            session.execute(SimpleStatement("DELETE value FROM tombstonefailure WHERE id = 0 and c = {}".format(num_id),
                                             consistency_level=self.consistency_level, retry_policy=FallthroughRetryPolicy()))
 
     def _perform_cql_statement(self, session, text_statement):
-        statement = session.prepare(text_statement)
-        statement.consistency_level = self.consistency_level
+        statement = SimpleStatement(text_statement,
+                                    consistency_level=self.consistency_level,
+                                    retry_policy=FallthroughRetryPolicy())
 
         if self.expected_expt is None:
             session.execute(statement)
         else:
             with self.assertRaises(self.expected_expt) as cm:
-                session.execute(statement)
+                # On 2.1, we won't return the ReadTimeout from coordinator until actual timeout,
+                # so we need to up the default timeout of the driver session
+                session.execute(statement, timeout=15)
             return cm.exception
 
     def _assert_error_code_map_exists_with_code(self, exception, expected_code):
@@ -79,9 +80,6 @@ class TestReadFailures(Tester):
                 break
         self.assertTrue(expected_code_found, "The error code map did not contain " + str(expected_code))
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-12531',
-                   flaky=False)
     @since('2.1')
     def test_tombstone_failure_v3(self):
         """
@@ -93,9 +91,6 @@ class TestReadFailures(Tester):
         self._insert_tombstones(session, 600)
         self._perform_cql_statement(session, "SELECT value FROM tombstonefailure")
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-12531',
-                   flaky=False)
     @since('2.2')
     def test_tombstone_failure_v4(self):
         """

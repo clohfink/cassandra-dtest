@@ -6,15 +6,14 @@ from unittest import SkipTest, skipUnless
 from cassandra import ConsistencyLevel as CL
 from cassandra import InvalidRequest
 from cassandra.query import SimpleStatement, dict_factory, named_tuple_factory
-from ccmlib.node import TimeoutError
+from ccmlib.common import LogPatternToVersion
 from nose.tools import assert_not_in
 
 from dtest import RUN_STATIC_UPGRADE_MATRIX, debug, run_scenarios
-from distutils.version import LooseVersion
 from tools.assertions import assert_read_timeout_or_failure
 from tools.data import rows_to_list
 from tools.datahelp import create_rows, flatten_into_set, parse_data_into_dicts
-from tools.decorators import known_failure, since
+from tools.decorators import since
 from tools.paging import PageAssertionMixin, PageFetcher
 from upgrade_base import UpgradeTester
 from upgrade_manifest import build_upgrade_pairs
@@ -30,8 +29,7 @@ class BasePagingTester(UpgradeTester):
                 debug("Protocol version set to v3, due to 2.1.x/2.2.x and 3.0.x mixed version cluster.")
                 kwargs['protocol_version'] = 3
 
-        cursor = UpgradeTester.prepare(self, *args, **kwargs)
-        cursor.row_factory = dict_factory
+        cursor = UpgradeTester.prepare(self, *args, row_factory=kwargs.pop('row_factory', dict_factory), **kwargs)
         return cursor
 
 
@@ -48,8 +46,7 @@ class TestPagingSize(BasePagingTester, PageAssertionMixin):
         cursor = self.prepare()
         cursor.execute("CREATE TABLE paging_test ( id int PRIMARY KEY, value text )")
 
-        for is_upgraded, cursor in self.do_upgrade(cursor):
-            cursor.row_factory = dict_factory
+        for is_upgraded, cursor in self.do_upgrade(cursor, row_factory=dict_factory):
             debug("Querying %s node" % ("upgraded" if is_upgraded else "old",))
 
             # run a query that has no results and make sure it's exhausted
@@ -66,8 +63,7 @@ class TestPagingSize(BasePagingTester, PageAssertionMixin):
         cursor = self.prepare()
         cursor.execute("CREATE TABLE paging_test ( id int PRIMARY KEY, value text )")
 
-        for is_upgraded, cursor in self.do_upgrade(cursor):
-            cursor.row_factory = dict_factory
+        for is_upgraded, cursor in self.do_upgrade(cursor, row_factory=dict_factory):
             debug("Querying %s node" % ("upgraded" if is_upgraded else "old",))
             cursor.execute("TRUNCATE paging_test")
 
@@ -94,8 +90,7 @@ class TestPagingSize(BasePagingTester, PageAssertionMixin):
         cursor = self.prepare()
         cursor.execute("CREATE TABLE paging_test ( id int PRIMARY KEY, value text )")
 
-        for is_upgraded, cursor in self.do_upgrade(cursor):
-            cursor.row_factory = dict_factory
+        for is_upgraded, cursor in self.do_upgrade(cursor, row_factory=dict_factory):
             debug("Querying %s node" % ("upgraded" if is_upgraded else "old",))
             cursor.execute("TRUNCATE paging_test")
 
@@ -129,8 +124,7 @@ class TestPagingSize(BasePagingTester, PageAssertionMixin):
         cursor = self.prepare()
         cursor.execute("CREATE TABLE paging_test ( id int PRIMARY KEY, value text )")
 
-        for is_upgraded, cursor in self.do_upgrade(cursor):
-            cursor.row_factory = dict_factory
+        for is_upgraded, cursor in self.do_upgrade(cursor, row_factory=dict_factory):
             debug("Querying %s node" % ("upgraded" if is_upgraded else "old",))
             cursor.execute("TRUNCATE paging_test")
 
@@ -166,8 +160,7 @@ class TestPagingSize(BasePagingTester, PageAssertionMixin):
         def random_txt(text):
             return uuid.uuid4()
 
-        for is_upgraded, cursor in self.do_upgrade(cursor):
-            cursor.row_factory = dict_factory
+        for is_upgraded, cursor in self.do_upgrade(cursor, row_factory=dict_factory):
             debug("Querying %s node" % ("upgraded" if is_upgraded else "old",))
             cursor.execute("TRUNCATE paging_test")
 
@@ -210,8 +203,7 @@ class TestPagingWithModifiers(BasePagingTester, PageAssertionMixin):
             ) WITH CLUSTERING ORDER BY (value ASC)
             """)
 
-        for is_upgraded, cursor in self.do_upgrade(cursor):
-            cursor.row_factory = dict_factory
+        for is_upgraded, cursor in self.do_upgrade(cursor, row_factory=dict_factory):
             debug("Querying %s node" % ("upgraded" if is_upgraded else "old",))
             cursor.execute("TRUNCATE paging_test")
 
@@ -264,8 +256,7 @@ class TestPagingWithModifiers(BasePagingTester, PageAssertionMixin):
             ) WITH CLUSTERING ORDER BY (value DESC)
             """)
 
-        for is_upgraded, cursor in self.do_upgrade(cursor):
-            cursor.row_factory = dict_factory
+        for is_upgraded, cursor in self.do_upgrade(cursor, row_factory=dict_factory):
             debug("Querying %s node" % ("upgraded" if is_upgraded else "old",))
             cursor.execute("TRUNCATE paging_test")
 
@@ -318,8 +309,7 @@ class TestPagingWithModifiers(BasePagingTester, PageAssertionMixin):
         def random_txt(text):
             return unicode(uuid.uuid4())
 
-        for is_upgraded, cursor in self.do_upgrade(cursor):
-            cursor.row_factory = dict_factory
+        for is_upgraded, cursor in self.do_upgrade(cursor, row_factory=dict_factory):
             debug("Querying %s node" % ("upgraded" if is_upgraded else "old",))
             cursor.execute("TRUNCATE paging_test")
 
@@ -401,8 +391,7 @@ class TestPagingWithModifiers(BasePagingTester, PageAssertionMixin):
         cursor = self.prepare()
         cursor.execute("CREATE TABLE paging_test ( id int, value text, PRIMARY KEY (id, value) )")
 
-        for is_upgraded, cursor in self.do_upgrade(cursor):
-            cursor.row_factory = dict_factory
+        for is_upgraded, cursor in self.do_upgrade(cursor, row_factory=dict_factory):
             debug("Querying %s node" % ("upgraded" if is_upgraded else "old",))
             cursor.execute("TRUNCATE paging_test")
 
@@ -552,8 +541,7 @@ class TestPagingData(BasePagingTester, PageAssertionMixin):
         def random_txt(text):
             return unicode(uuid.uuid4())
 
-        for is_upgraded, cursor in self.do_upgrade(cursor):
-            cursor.row_factory = dict_factory
+        for is_upgraded, cursor in self.do_upgrade(cursor, row_factory=dict_factory):
             debug("Querying %s node" % ("upgraded" if is_upgraded else "old",))
             cursor.execute("TRUNCATE paging_test")
 
@@ -584,8 +572,7 @@ class TestPagingData(BasePagingTester, PageAssertionMixin):
         def random_txt(text):
             return unicode(uuid.uuid4())
 
-        for is_upgraded, cursor in self.do_upgrade(cursor):
-            cursor.row_factory = dict_factory
+        for is_upgraded, cursor in self.do_upgrade(cursor, row_factory=dict_factory):
             debug("Querying %s node" % ("upgraded" if is_upgraded else "old",))
             cursor.execute("TRUNCATE paging_test")
 
@@ -618,8 +605,7 @@ class TestPagingData(BasePagingTester, PageAssertionMixin):
         def bool_from_str_int(text):
             return bool(int(text))
 
-        for is_upgraded, cursor in self.do_upgrade(cursor):
-            cursor.row_factory = dict_factory
+        for is_upgraded, cursor in self.do_upgrade(cursor, row_factory=dict_factory):
             debug("Querying %s node" % ("upgraded" if is_upgraded else "old",))
             cursor.execute("TRUNCATE paging_test")
 
@@ -648,13 +634,6 @@ class TestPagingData(BasePagingTester, PageAssertionMixin):
             self.assertEqual(pf.num_results_all(), [400, 200])
             self.assertEqualIgnoreOrder(expected_data, pf.all_data())
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-12491',
-                   flaky=True)
-    @known_failure(failure_source='cassandra',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11195',
-                   flaky=True,
-                   notes='so far only observed on 2-node clusters w/ RF=1')
     @since('2.0.6')
     def static_columns_paging_test(self):
         """
@@ -662,20 +641,18 @@ class TestPagingData(BasePagingTester, PageAssertionMixin):
         @jira_ticket CASSANDRA-8502.
         """
 
-        cursor = self.prepare()
+        cursor = self.prepare(row_factory=named_tuple_factory)
         cursor.execute("CREATE TABLE test (a int, b int, c int, s1 int static, s2 int static, PRIMARY KEY (a, b))")
 
-        for is_upgraded, cursor in self.do_upgrade(cursor):
+        for is_upgraded, cursor in self.do_upgrade(cursor, row_factory=named_tuple_factory):
             min_version = min(self.get_node_versions())
             latest_version_with_bug = '2.2.3'
             if min_version <= latest_version_with_bug:
                 raise SkipTest('known bug released in {latest_ver} and earlier (current min version {min_ver}); '
                                'skipping'.format(latest_ver=latest_version_with_bug, min_ver=min_version))
 
-            cursor.row_factory = dict_factory
             debug("Querying %s node" % ("upgraded" if is_upgraded else "old",))
             cursor.execute("TRUNCATE test")
-            cursor.row_factory = named_tuple_factory
 
             for i in range(4):
                 for j in range(4):
@@ -896,8 +873,7 @@ class TestPagingData(BasePagingTester, PageAssertionMixin):
         def bool_from_str_int(text):
             return bool(int(text))
 
-        for is_upgraded, cursor in self.do_upgrade(cursor):
-            cursor.row_factory = dict_factory
+        for is_upgraded, cursor in self.do_upgrade(cursor, row_factory=dict_factory):
             debug("Querying %s node" % ("upgraded" if is_upgraded else "old",))
             cursor.execute("TRUNCATE paging_test")
 
@@ -939,8 +915,7 @@ class TestPagingDatasetChanges(BasePagingTester, PageAssertionMixin):
         def random_txt(text):
             return unicode(uuid.uuid4())
 
-        for is_upgraded, cursor in self.do_upgrade(cursor):
-            cursor.row_factory = dict_factory
+        for is_upgraded, cursor in self.do_upgrade(cursor, row_factory=dict_factory):
             debug("Querying %s node" % ("upgraded" if is_upgraded else "old",))
             cursor.execute("TRUNCATE paging_test")
 
@@ -976,8 +951,7 @@ class TestPagingDatasetChanges(BasePagingTester, PageAssertionMixin):
         def random_txt(text):
             return unicode(uuid.uuid4())
 
-        for is_upgraded, cursor in self.do_upgrade(cursor):
-            cursor.row_factory = dict_factory
+        for is_upgraded, cursor in self.do_upgrade(cursor, row_factory=dict_factory):
             debug("Querying %s node" % ("upgraded" if is_upgraded else "old",))
             cursor.execute("TRUNCATE paging_test")
 
@@ -1007,12 +981,6 @@ class TestPagingDatasetChanges(BasePagingTester, PageAssertionMixin):
             expected_data.append({u'id': 2, u'mytext': u'foo'})
             self.assertEqualIgnoreOrder(pf.all_data(), expected_data)
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-12400',
-                   flaky=False)
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-12362',
-                   flaky=True)
     def test_row_TTL_expiry_during_paging(self):
         cursor = self.prepare()
         cursor.execute("CREATE TABLE paging_test ( id int, mytext text, PRIMARY KEY (id, mytext) )")
@@ -1020,8 +988,7 @@ class TestPagingDatasetChanges(BasePagingTester, PageAssertionMixin):
         def random_txt(text):
             return unicode(uuid.uuid4())
 
-        for is_upgraded, cursor in self.do_upgrade(cursor):
-            cursor.row_factory = dict_factory
+        for is_upgraded, cursor in self.do_upgrade(cursor, row_factory=dict_factory):
             debug("Querying %s node" % ("upgraded" if is_upgraded else "old",))
             cursor.execute("TRUNCATE paging_test")
 
@@ -1059,9 +1026,6 @@ class TestPagingDatasetChanges(BasePagingTester, PageAssertionMixin):
             self.assertEqual(pf.pagecount(), 3)
             self.assertEqual(pf.num_results_all(), [300, 300, 200])
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-12364',
-                   flaky=True)
     def test_cell_TTL_expiry_during_paging(self):
         cursor = self.prepare()
         cursor.execute("""
@@ -1076,8 +1040,7 @@ class TestPagingDatasetChanges(BasePagingTester, PageAssertionMixin):
         def random_txt(text):
             return unicode(uuid.uuid4())
 
-        for is_upgraded, cursor in self.do_upgrade(cursor):
-            cursor.row_factory = dict_factory
+        for is_upgraded, cursor in self.do_upgrade(cursor, row_factory=dict_factory):
             debug("Querying %s node" % ("upgraded" if is_upgraded else "old",))
             cursor.execute("TRUNCATE paging_test")
 
@@ -1146,8 +1109,7 @@ class TestPagingQueryIsolation(BasePagingTester, PageAssertionMixin):
         def random_txt(text):
             return unicode(uuid.uuid4())
 
-        for is_upgraded, cursor in self.do_upgrade(cursor):
-            cursor.row_factory = dict_factory
+        for is_upgraded, cursor in self.do_upgrade(cursor, row_factory=dict_factory):
             debug("Querying %s node" % ("upgraded" if is_upgraded else "old",))
             cursor.execute("TRUNCATE paging_test")
 
@@ -1287,8 +1249,7 @@ class TestPagingWithDeletions(BasePagingTester, PageAssertionMixin):
         cursor = self.prepare()
         self.setup_schema(cursor)
 
-        for is_upgraded, cursor in self.do_upgrade(cursor):
-            cursor.row_factory = dict_factory
+        for is_upgraded, cursor in self.do_upgrade(cursor, row_factory=dict_factory):
             debug("Querying %s node" % ("upgraded" if is_upgraded else "old",))
             cursor.execute("TRUNCATE paging_test")
 
@@ -1334,8 +1295,7 @@ class TestPagingWithDeletions(BasePagingTester, PageAssertionMixin):
         cursor = self.prepare()
         self.setup_schema(cursor)
 
-        for is_upgraded, cursor in self.do_upgrade(cursor):
-            cursor.row_factory = dict_factory
+        for is_upgraded, cursor in self.do_upgrade(cursor, row_factory=dict_factory):
             debug("Querying %s node" % ("upgraded" if is_upgraded else "old",))
             cursor.execute("TRUNCATE paging_test")
             expected_data = self.setup_data(cursor)
@@ -1354,8 +1314,7 @@ class TestPagingWithDeletions(BasePagingTester, PageAssertionMixin):
         cursor = self.prepare()
         self.setup_schema(cursor)
 
-        for is_upgraded, cursor in self.do_upgrade(cursor):
-            cursor.row_factory = dict_factory
+        for is_upgraded, cursor in self.do_upgrade(cursor, row_factory=dict_factory):
             debug("Querying %s node" % ("upgraded" if is_upgraded else "old",))
             cursor.execute("TRUNCATE paging_test")
             expected_data = self.setup_data(cursor)
@@ -1405,8 +1364,7 @@ class TestPagingWithDeletions(BasePagingTester, PageAssertionMixin):
         cursor = self.prepare()
         self.setup_schema(cursor)
 
-        for is_upgraded, cursor in self.do_upgrade(cursor):
-            cursor.row_factory = dict_factory
+        for is_upgraded, cursor in self.do_upgrade(cursor, row_factory=dict_factory):
             debug("Querying %s node" % ("upgraded" if is_upgraded else "old",))
             cursor.execute("TRUNCATE paging_test")
             expected_data = self.setup_data(cursor)
@@ -1458,8 +1416,7 @@ class TestPagingWithDeletions(BasePagingTester, PageAssertionMixin):
         cursor = self.prepare()
         self.setup_schema(cursor)
 
-        for is_upgraded, cursor in self.do_upgrade(cursor):
-            cursor.row_factory = dict_factory
+        for is_upgraded, cursor in self.do_upgrade(cursor, row_factory=dict_factory):
             debug("Querying %s node" % ("upgraded" if is_upgraded else "old",))
             cursor.execute("TRUNCATE paging_test")
             expected_data = self.setup_data(cursor)
@@ -1499,8 +1456,7 @@ class TestPagingWithDeletions(BasePagingTester, PageAssertionMixin):
         cursor = self.prepare()
         self.setup_schema(cursor)
 
-        for is_upgraded, cursor in self.do_upgrade(cursor):
-            cursor.row_factory = dict_factory
+        for is_upgraded, cursor in self.do_upgrade(cursor, row_factory=dict_factory):
             debug("Querying %s node" % ("upgraded" if is_upgraded else "old",))
             cursor.execute("TRUNCATE paging_test")
             data = self.setup_data(cursor)
@@ -1528,8 +1484,7 @@ class TestPagingWithDeletions(BasePagingTester, PageAssertionMixin):
         nodes = self.cluster.nodelist()
         self.setup_schema(cursor)
 
-        for is_upgraded, cursor in self.do_upgrade(cursor):
-            cursor.row_factory = dict_factory
+        for is_upgraded, cursor in self.do_upgrade(cursor, row_factory=dict_factory):
             debug("Querying %s node" % ("upgraded" if is_upgraded else "old",))
             cursor.execute("TRUNCATE paging_test")
             self.setup_data(cursor)
@@ -1547,23 +1502,10 @@ class TestPagingWithDeletions(BasePagingTester, PageAssertionMixin):
             stmt = SimpleStatement("select * from paging_test", fetch_size=1000, consistency_level=CL.ALL)
             assert_read_timeout_or_failure(cursor, stmt)
 
-            self._grep_for_aborted_query_patterns(nodes, 50)
-
-    def _grep_for_aborted_query_patterns(self, nodes, timeout):
-        old_pattern = r"Scanned over.* tombstones in ks.paging_test.* query aborted"
-        new_pattern = r"Scanned over.* tombstones during query 'SELECT \* FROM ks.paging_test.* query aborted"
-
-        end_time = time.time() + timeout
-        while True:
-            if time.time() > end_time:
-                raise TimeoutError(time.strftime("%d %b %Y %H:%M:%S", time.gmtime()) +
-                                   " Unable to find: " + old_pattern + "or " + new_pattern + "in any node log within " + str(50) + "s")
-            for node in nodes:
-                pattern = old_pattern if LooseVersion(node.get_cassandra_version()) < LooseVersion('3.0') else new_pattern
-
-                if node.grep_log(pattern, "system.log"):
-                    return True
-            time.sleep(1)
+            # Grep each node in the cluster for aborted query logs
+            self.cluster.timed_grep_nodes_for_patterns(LogPatternToVersion({"2.2": r"Scanned over.* tombstones in ks.paging_test.* query aborted",
+                                                                            "3.0": r"Scanned over.* tombstones during query 'SELECT \* FROM ks.paging_test.* query aborted"}, default_pattern=""),
+                                                       timeout_seconds=50)
 
 
 topology_specs = [

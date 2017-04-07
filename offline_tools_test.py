@@ -7,8 +7,8 @@ import subprocess
 from ccmlib import common
 from ccmlib.node import ToolError
 
-from dtest import Tester, debug
-from tools.decorators import known_failure, since
+from dtest import Tester, debug, create_ks
+from tools.decorators import since
 
 
 class TestOfflineTools(Tester):
@@ -97,13 +97,6 @@ class TestOfflineTools(Tester):
             if pattern.search(output):
                 break
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-12275',
-                   flaky=False,
-                   notes='windows')
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-12519',
-                   flaky=True)
     def sstableofflinerelevel_test(self):
         """
         Generate sstables of varying levels.
@@ -301,7 +294,7 @@ class TestOfflineTools(Tester):
         cluster.populate(1).start(wait_for_binary_proto=True)
         [node1] = cluster.nodelist()
         session = self.patient_cql_connection(node1)
-        self.create_ks(session, 'ks', 1)
+        create_ks(session, 'ks', 1)
         session.execute("create table ks.cf (key int PRIMARY KEY, val int) with gc_grace_seconds=0")
         # create a blocker:
         session.execute("insert into ks.cf (key, val) values (1,1)")
@@ -313,6 +306,11 @@ class TestOfflineTools(Tester):
         out, error, _ = node1.run_sstableexpiredblockers(keyspace="ks", column_family="cf")
         self.assertIn("blocks 2 expired sstables from getting dropped", out)
 
+    # 4.0 removes back compatibility with pre-3.0 versions, so testing upgradesstables for
+    # paths from those versions to 4.0 is invalid (and can only fail). There isn't currently
+    # any difference between the 3.0 and 4.0 sstable format though, but when the version is
+    # bumped for 4.0, remove the max_version & add a case for testing a 3.0 -> 4.0 upgrade
+    @since('2.2', max_version='3.X')
     def sstableupgrade_test(self):
         """
         Test that sstableupgrade functions properly offline on a same-version Cassandra sstable, a
@@ -337,9 +335,13 @@ class TestOfflineTools(Tester):
             debug('Test version: {} - installing git:cassandra-2.1'.format(testversion))
             cluster.set_install_dir(version='git:cassandra-2.1')
         # As of 3.5, sstable format 'ma' from 3.0 is still the latest - install 2.2 to upgrade from
-        else:
+        elif testversion < '4.0':
             debug('Test version: {} - installing git:cassandra-2.2'.format(testversion))
             cluster.set_install_dir(version='git:cassandra-2.2')
+        # From 4.0, one can only upgrade from 3.0
+        else:
+            debug('Test version: {} - installing git:cassandra-3.0'.format(testversion))
+            cluster.set_install_dir(version='git:cassandra-3.0')
 
         # Start up last major version, write out an sstable to upgrade, and stop node
         cluster.populate(1).start(wait_for_binary_proto=True)
@@ -347,7 +349,7 @@ class TestOfflineTools(Tester):
         # Check that node1 is actually what we expect
         debug('Downgraded install dir: {}'.format(node1.get_install_dir()))
         session = self.patient_cql_connection(node1)
-        self.create_ks(session, 'ks', 1)
+        create_ks(session, 'ks', 1)
         session.execute('create table ks.cf (key int PRIMARY KEY, val int) with gc_grace_seconds=0')
         session.execute('insert into ks.cf (key, val) values (1,1)')
         node1.flush()
@@ -362,11 +364,18 @@ class TestOfflineTools(Tester):
         cluster.start(wait_for_binary_proto=True)
         node1.flush()
         cluster.stop()
-        (out, error, rc) = node1.run_sstableupgrade(keyspace='ks', column_family='cf')
-        debug(out)
-        debug(error)
-        debug('Upgraded ks.cf sstable: {}'.format(node1.get_sstables(keyspace='ks', column_family='cf')))
-        self.assertIn('Found 1 sstables that need upgrading.', out)
+
+        # A bit hacky, but we can only upgrade to 4.0 from 3.0, but both use the
+        # same sstable major format currently, so there is no upgrading to do.
+        # So on 4.0, we only test that sstable upgrade detect there is no
+        # upgrade. We'll removed that test if 4.0 introduce a major sstable
+        # change before it's release.
+        if testversion < '4.0':
+            (out, error, rc) = node1.run_sstableupgrade(keyspace='ks', column_family='cf')
+            debug(out)
+            debug(error)
+            debug('Upgraded ks.cf sstable: {}'.format(node1.get_sstables(keyspace='ks', column_family='cf')))
+            self.assertIn('Found 1 sstables that need upgrading.', out)
 
         # Check that sstableupgrade finds no upgrade needed on current version.
         (out, error, rc) = node1.run_sstableupgrade(keyspace='ks', column_family='cf')
@@ -392,13 +401,19 @@ class TestOfflineTools(Tester):
         Test that sstabledump functions properly offline to output the contents of a table.
         """
         cluster = self.cluster
+        # disable JBOD conf since the test expects exactly one SSTable to be written.
+        cluster.set_datadir_count(1)
         cluster.populate(1).start(wait_for_binary_proto=True)
         [node1] = cluster.nodelist()
         session = self.patient_cql_connection(node1)
-
         self.create_ks(session, 'ks', 1)
         session.execute('create table ks.cf (key int PRIMARY KEY, val int) with gc_grace_seconds=0')
         session.execute('insert into ks.cf (key, val) values (1,1)')
+
+        # delete a partition and then insert a row to test CASSANDRA-13177
+        session.execute('DELETE FROM ks.cf WHERE key = 2')
+        session.execute('INSERT INTO ks.cf (key, val) VALUES (2, 2)')
+
         node1.flush()
         [(out, error, rc)] = node1.run_sstabledump(keyspace='ks', column_families=['cf'])
         debug(out)
@@ -407,9 +422,17 @@ class TestOfflineTools(Tester):
         # Load the json output and check that it contains the inserted key=1
         s = json.loads(out)
         debug(s)
-        self.assertEqual(len(s), 1)
-        dumped_row = s[0]
-        self.assertEqual(dumped_row['partition']['key'], ['1'])
+        self.assertEqual(len(s), 2)
+
+        # order the rows so that we have key=1 first, then key=2
+        row0, row1 = s
+        (row0, row1) = (row0, row1) if row0['partition']['key'] == ['1'] else (row1, row0)
+
+        self.assertEqual(row0['partition']['key'], ['1'])
+
+        self.assertEqual(row1['partition']['key'], ['2'])
+        self.assertIsNotNone(row1['partition'].get('deletion_info'))
+        self.assertIsNotNone(row1.get('rows'))
 
         # Check that we only get the key back using the enumerate option
         [(out, error, rc)] = node1.run_sstabledump(keyspace='ks', column_families=['cf'], enumerate_keys=True)
@@ -417,9 +440,9 @@ class TestOfflineTools(Tester):
         debug(error)
         s = json.loads(out)
         debug(s)
-        self.assertEqual(len(s), 1)
-        dumped_row = s[0][0]
-        self.assertEqual(dumped_row, '1')
+        self.assertEqual(len(s), 2)
+        dumped_keys = set(row[0] for row in s)
+        self.assertEqual(set(['1', '2']), dumped_keys)
 
         # check dumping collections
         session.execute("""CREATE TABLE ks.collections (

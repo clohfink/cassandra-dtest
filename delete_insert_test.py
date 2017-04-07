@@ -6,23 +6,19 @@ from cassandra import ConsistencyLevel
 from cassandra.query import SimpleStatement
 from nose.tools import assert_equal
 
-from dtest import Tester
+from dtest import Tester, create_ks
 
 
 class DeleteInsertTest(Tester):
     """
     Examines scenarios around deleting data and adding data back with the same key
     """
-
-    def __init__(self, *args, **kwargs):
-        Tester.__init__(self, *args, **kwargs)
-
-        # Generate 1000 rows in memory so we can re-use the same ones over again:
-        self.groups = ['group1', 'group2', 'group3', 'group4']
-        self.rows = [(str(uuid.uuid1()), x, random.choice(self.groups)) for x in range(1000)]
+    # Generate 1000 rows in memory so we can re-use the same ones over again:
+    groups = ['group1', 'group2', 'group3', 'group4']
+    rows = [(str(uuid.uuid1()), x, random.choice(groups)) for x in range(1000)]
 
     def create_ddl(self, session, rf={'dc1': 2, 'dc2': 2}):
-        self.create_ks(session, 'delete_insert_search_test', rf)
+        create_ks(session, 'delete_insert_search_test', rf)
         session.execute('CREATE TABLE test (id uuid PRIMARY KEY, val1 text, group text)')
         session.execute('CREATE INDEX group_idx ON test (group)')
 

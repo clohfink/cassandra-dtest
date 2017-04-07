@@ -12,21 +12,17 @@ from ccmlib.common import is_win
 from ccmlib.node import Node, TimeoutError
 from parse import parse
 
-from dtest import Tester, debug
+from dtest import Tester, debug, create_ks
 from tools.assertions import assert_almost_equal, assert_none, assert_one
 from tools.data import rows_to_list
-from tools.decorators import known_failure, since
+from tools.decorators import since
 
 
 class TestCommitLog(Tester):
     """
     CommitLog Tests
     """
-
-    def __init__(self, *argv, **kwargs):
-        kwargs['cluster_options'] = {'start_rpc': 'true'}
-        super(TestCommitLog, self).__init__(*argv, **kwargs)
-        self.allow_log_errors = True
+    allow_log_errors = True
 
     def setUp(self):
         super(TestCommitLog, self).setUp()
@@ -53,7 +49,7 @@ class TestCommitLog(Tester):
         self.session1 = self.patient_cql_connection(self.node1)
         if create_test_keyspace:
             self.session1.execute("DROP KEYSPACE IF EXISTS ks;")
-            self.create_ks(self.session1, 'ks', 1)
+            create_ks(self.session1, 'ks', 1)
             self.session1.execute("DROP TABLE IF EXISTS test;")
             query = """
               CREATE TABLE test (
@@ -169,7 +165,7 @@ class TestCommitLog(Tester):
         @jira_ticket CASSANDRA-11891
         """
 
-        cluster_ver = LooseVersion(self.cluster.version())
+        cluster_ver = self.cluster.version()
         if LooseVersion('3.1') <= cluster_ver < LooseVersion('3.7'):
             self.skipTest("Fixed in 3.0.7 and 3.7")
 
@@ -179,7 +175,7 @@ class TestCommitLog(Tester):
         session = self.patient_cql_connection(node1)
 
         debug("Creating schema")
-        self.create_ks(session, 'Test', 1)
+        create_ks(session, 'Test', 1)
         session.execute("""
             CREATE TABLE mytable (
                 a int,
@@ -228,9 +224,6 @@ class TestCommitLog(Tester):
         res = list(session.execute("SELECT * FROM Test.mytable"))
         self.assertEqual(num_rows, len(res), res)
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-12213',
-                   flaky=True)
     def test_commitlog_replay_on_startup(self):
         """
         Test commit log replay
@@ -241,7 +234,7 @@ class TestCommitLog(Tester):
 
         debug("Insert data")
         session = self.patient_cql_connection(node1)
-        self.create_ks(session, 'Test', 1)
+        create_ks(session, 'Test', 1)
         session.execute("""
             CREATE TABLE users (
                 user_name varchar PRIMARY KEY,
@@ -316,10 +309,6 @@ class TestCommitLog(Tester):
         """
         self._segment_size_test(5, compressed=True)
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11248',
-                   flaky=True,
-                   notes='windows')
     def stop_failure_policy_test(self):
         """
         Test the stop commitlog failure policy (default one)
@@ -344,10 +333,6 @@ class TestCommitLog(Tester):
               "SELECT * FROM test;"
             """)
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11248',
-                   flaky=True,
-                   notes='windows')
     def stop_commit_failure_policy_test(self):
         """
         Test the stop_commit commitlog failure policy
@@ -381,10 +366,6 @@ class TestCommitLog(Tester):
             [2, 2]
         )
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11245',
-                   flaky=False,
-                   notes='windows')
     def die_failure_policy_test(self):
         """
         Test the die commitlog failure policy
@@ -399,10 +380,6 @@ class TestCommitLog(Tester):
         self.assertTrue(failure, "Cannot find the commitlog failure message in logs")
         self.assertFalse(self.node1.is_running(), "Node1 should not be running")
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11242',
-                   flaky=True,
-                   notes='windows')
     def ignore_failure_policy_test(self):
         """
         Test the ignore commitlog failure policy
@@ -452,10 +429,6 @@ class TestCommitLog(Tester):
             [2, 2]
         )
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11285',
-                   flaky=True,
-                   notes='windows')
     @since('2.2')
     def test_bad_crc(self):
         """
@@ -474,7 +447,7 @@ class TestCommitLog(Tester):
         self.cluster.start()
 
         cursor = self.patient_cql_connection(self.cluster.nodelist()[0])
-        self.create_ks(cursor, 'ks', 1)
+        create_ks(cursor, 'ks', 1)
         cursor.execute("CREATE TABLE ks.tbl (k INT PRIMARY KEY, v INT)")
 
         for i in range(10):
@@ -530,10 +503,6 @@ class TestCommitLog(Tester):
             node.wait_for_binary_interface(from_mark=mark, timeout=20)
         self.assertFalse(node.is_running())
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11276',
-                   flaky=True,
-                   notes='windows')
     @since('2.2')
     def test_compression_error(self):
         """
@@ -554,7 +523,7 @@ class TestCommitLog(Tester):
         self.cluster.start()
 
         cursor = self.patient_cql_connection(self.cluster.nodelist()[0])
-        self.create_ks(cursor, 'ks1', 1)
+        create_ks(cursor, 'ks1', 1)
         cursor.execute("CREATE TABLE ks1.tbl (k INT PRIMARY KEY, v INT)")
 
         for i in range(10):

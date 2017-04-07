@@ -1,33 +1,34 @@
 import time
 from collections import namedtuple
+from datetime import datetime, timedelta
 from distutils.version import LooseVersion
+
+from nose.tools import assert_regexp_matches
 
 from cassandra import AuthenticationFailed, InvalidRequest, Unauthorized
 from cassandra.cluster import NoHostAvailable
-from cassandra.protocol import SyntaxException
+from cassandra.protocol import ServerError, SyntaxException
 
 from dtest import CASSANDRA_VERSION_FROM_BUILD, Tester, debug
-from tools.assertions import (assert_all, assert_invalid, assert_one,
+from tools.assertions import (assert_all, assert_exception, assert_invalid,
+                              assert_length_equal, assert_one,
                               assert_unauthorized)
-from tools.decorators import known_failure, since
+from tools.decorators import since
 from tools.jmxutils import (JolokiaAgent, make_mbean,
                             remove_perf_disable_shared_mem)
+from tools.metadata_wrapper import UpdatingKeyspaceMetadataWrapper
+from tools.misc import ImmutableMapping
 
 
 class TestAuth(Tester):
 
-    def __init__(self, *args, **kwargs):
-        self.ignore_log_patterns = [
-            # This one occurs if we do a non-rolling upgrade, the node
-            # it's trying to send the migration to hasn't started yet,
-            # and when it does, it gets replayed and everything is fine.
-            r'Can\'t send migration request: node.*is down',
-        ]
-        Tester.__init__(self, *args, **kwargs)
+    ignore_log_patterns = (
+        # This one occurs if we do a non-rolling upgrade, the node
+        # it's trying to send the migration to hasn't started yet,
+        # and when it does, it gets replayed and everything is fine.
+        r'Can\'t send migration request: node.*is down',
+    )
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-12456',
-                   flaky=True)
     def system_auth_ks_is_alterable_test(self):
         """
         * Launch a three node cluster
@@ -43,20 +44,26 @@ class TestAuth(Tester):
         debug("nodes started")
 
         session = self.get_session(user='cassandra', password='cassandra')
-        self.assertEquals(1, session.cluster.metadata.keyspaces['system_auth'].replication_strategy.replication_factor)
+        auth_metadata = UpdatingKeyspaceMetadataWrapper(
+            cluster=session.cluster,
+            ks_name='system_auth',
+            max_schema_agreement_wait=30  # 3x the default of 10
+        )
+        self.assertEquals(1, auth_metadata.replication_strategy.replication_factor)
 
         session.execute("""
             ALTER KEYSPACE system_auth
                 WITH replication = {'class':'SimpleStrategy', 'replication_factor':3};
         """)
-        # The driver schema metadata API is async. Force a hard refresh here, before we check that the alter succeeded.
-        session.cluster.refresh_schema_metadata()
 
-        self.assertEquals(3, session.cluster.metadata.keyspaces['system_auth'].replication_strategy.replication_factor)
+        self.assertEquals(3, auth_metadata.replication_strategy.replication_factor)
 
         # Run repair to workaround read repair issues caused by CASSANDRA-10655
         debug("Repairing before altering RF")
         self.cluster.repair()
+
+        debug("Shutting down client session")
+        session.shutdown()
 
         # make sure schema change is persistent
         debug("Stopping cluster..")
@@ -68,8 +75,11 @@ class TestAuth(Tester):
         for i in range(3):
             debug('Checking node: {i}'.format(i=i))
             node = self.cluster.nodelist()[i]
-            session = self.patient_exclusive_cql_connection(node, user='cassandra', password='cassandra')
-            self.assertEquals(3, session.cluster.metadata.keyspaces['system_auth'].replication_strategy.replication_factor)
+            exclusive_auth_metadata = UpdatingKeyspaceMetadataWrapper(
+                cluster=self.patient_exclusive_cql_connection(node, user='cassandra', password='cassandra').cluster,
+                ks_name='system_auth'
+            )
+            self.assertEquals(3, exclusive_auth_metadata.replication_strategy.replication_factor)
 
     def login_test(self):
         """
@@ -174,6 +184,36 @@ class TestAuth(Tester):
         self.assertTrue(users['bob'])
         self.assertFalse(users['cathy'])
         self.assertTrue(users['dave'])
+
+    @since('2.2')
+    def handle_corrupt_role_data_test(self):
+        """
+        * Launch a one node cluster
+        * Connect as the default superuser
+        * Create a new role
+        * Confirm that there exists 2 users
+        * Manually corrupt / delete the is_superuser cell of that role
+        * Confirm that listing users shows an invalid request
+        * Confirm that corrupted user can no longer login
+        @jira_ticket CASSANDRA-12700
+        """
+        self.prepare()
+
+        session = self.get_session(user='cassandra', password='cassandra')
+        session.execute("CREATE USER bob WITH PASSWORD '12345' SUPERUSER")
+
+        bob = self.get_session(user='bob', password='12345')
+        rows = list(bob.execute("LIST USERS"))
+        assert_length_equal(rows, 2)
+
+        session.execute("UPDATE system_auth.roles SET is_superuser=null WHERE role='bob'")
+
+        self.ignore_log_patterns = list(self.ignore_log_patterns) + [r'Invalid metadata has been detected for role bob']
+        assert_exception(session, "LIST USERS", "Invalid metadata has been detected for role", expected=(ServerError))
+        try:
+            self.get_session(user='bob', password='12345')
+        except NoHostAvailable as e:
+            self.assertIsInstance(e.errors.values()[0], AuthenticationFailed)
 
     def user_cant_drop_themselves_test(self):
         """
@@ -614,6 +654,39 @@ class TestAuth(Tester):
         rows = list(cathy.execute("TRUNCATE ks.cf"))
         self.assertItemsEqual(rows, [])
 
+    @since('2.2')
+    def grant_revoke_without_ks_specified_test(self):
+        """
+        * Launch a one node cluster
+        * Connect as the default superuser
+        * Create table ks.cf
+        * Create a new users, 'cathy' and 'bob', with no permissions
+        * Grant ALL on ks.cf to cathy
+        * As cathy, try granting SELECT on cf to bob, without specifying the ks; verify it fails
+        * As cathy, USE ks, try again, verify it works this time
+        """
+        self.prepare()
+
+        cassandra = self.get_session(user='cassandra', password='cassandra')
+
+        cassandra.execute("CREATE KEYSPACE ks WITH replication = {'class':'SimpleStrategy', 'replication_factor':1}")
+        cassandra.execute("CREATE TABLE ks.cf (id int primary key, val int)")
+
+        cassandra.execute("CREATE USER cathy WITH PASSWORD '12345'")
+        cassandra.execute("CREATE USER bob WITH PASSWORD '12345'")
+
+        cassandra.execute("GRANT ALL ON ks.cf TO cathy")
+
+        cathy = self.get_session(user='cathy', password='12345')
+        bob = self.get_session(user='bob', password='12345')
+
+        assert_invalid(cathy, "GRANT SELECT ON cf TO bob", "No keyspace has been specified. USE a keyspace, or explicitly specify keyspace.tablename")
+        assert_unauthorized(bob, "SELECT * FROM ks.cf", "User bob has no SELECT permission on <table ks.cf> or any of its parents")
+
+        cathy.execute("USE ks")
+        cathy.execute("GRANT SELECT ON cf TO bob")
+        bob.execute("SELECT * FROM ks.cf")
+
     def grant_revoke_auth_test(self):
         """
         * Launch a one node cluster
@@ -750,12 +823,35 @@ class TestAuth(Tester):
 
         assert_unauthorized(cathy, "SELECT * FROM ks.cf", "User cathy has no SELECT permission on <table ks.cf> or any of its parents")
 
-        # grant SELECT to cathy
-        cassandra.execute("GRANT SELECT ON ks.cf TO cathy")
-        # should still fail after 1 second.
-        time.sleep(1.0)
-        for c in cathys:
-            assert_unauthorized(c, "SELECT * FROM ks.cf", "User cathy has no SELECT permission on <table ks.cf> or any of its parents")
+        def check_caching(attempt=0):
+            attempt += 1
+            if attempt > 3:
+                self.fail("Unable to verify cache expiry in 3 attempts, failing")
+
+            debug("Attempting to verify cache expiry, attempt #{i}".format(i=attempt))
+            # grant SELECT to cathy
+            cassandra.execute("GRANT SELECT ON ks.cf TO cathy")
+            grant_time = datetime.now()
+            # selects should still fail after 1 second, but if execution was
+            # delayed for some reason such that the cache expired, retry
+            time.sleep(1.0)
+            for c in cathys:
+                try:
+                    c.execute("SELECT * FROM ks.cf")
+                    # this should still fail, but if the cache has expired while we paused, try again
+                    delta = datetime.now() - grant_time
+                    if delta > timedelta(seconds=2):
+                        # try again
+                        cassandra.execute("REVOKE SELECT ON ks.cf FROM cathy")
+                        time.sleep(2.5)
+                        check_caching(attempt)
+                    else:
+                        # legit failure
+                        self.fail("Expecting query to raise an exception, but nothing was raised.")
+                except Unauthorized as e:
+                    assert_regexp_matches(str(e), "User cathy has no SELECT permission on <table ks.cf> or any of its parents")
+
+        check_caching()
 
         # wait until the cache definitely expires and retry - should succeed now
         time.sleep(1.5)
@@ -976,7 +1072,7 @@ class TestAuth(Tester):
         self.cluster.set_configuration_options(values=config)
         self.cluster.populate(nodes).start()
 
-        n = self.wait_for_any_log(self.cluster.nodelist(), 'Created default superuser', 25)
+        n = self.cluster.wait_for_any_log('Created default superuser', 25)
         debug("Default role created by " + n.name)
 
     def get_session(self, node_idx=0, user=None, password=None):
@@ -1022,6 +1118,7 @@ def data_resource_creator_permissions(creator, resource):
             permissions.append((creator, '<all functions in %s>' % keyspace, perm))
     return permissions
 
+
 # First value is the role name
 # Second value is superuser status
 # Third value is login status
@@ -1040,14 +1137,11 @@ class TestAuthRoles(Tester):
     """
     @jira_ticket CASSANDRA-7653
     """
-
-    def __init__(self, *args, **kwargs):
-        if CASSANDRA_VERSION_FROM_BUILD >= '3.0':
-            kwargs['cluster_options'] = {'enable_user_defined_functions': 'true',
-                                         'enable_scripted_user_defined_functions': 'true'}
-        else:
-            kwargs['cluster_options'] = {'enable_user_defined_functions': 'true'}
-        Tester.__init__(self, *args, **kwargs)
+    if CASSANDRA_VERSION_FROM_BUILD >= '3.0':
+        cluster_options = ImmutableMapping({'enable_user_defined_functions': 'true',
+                                            'enable_scripted_user_defined_functions': 'true'})
+    else:
+        cluster_options = ImmutableMapping({'enable_user_defined_functions': 'true'})
 
     def create_drop_role_test(self):
         """
@@ -2277,19 +2371,22 @@ class TestAuthRoles(Tester):
         """
         * Launch a one node cluster
         * Connect as the default superuser
-        * Create a new role, 'mike', and a UDF
-        * Grant mike permissions to the UDF
-        * Drop the keyspace containing the UDF
+        * Create a new role, 'mike', a UDF and a UDA which uses for its state function
+        * Grant mike permissions to the UDF & UDA
+        * Drop the keyspace containing the UDF & UDA
         * Verify mike has no permissions
         """
         self.prepare()
         cassandra = self.get_session(user='cassandra', password='cassandra')
         self.setup_table(cassandra)
         cassandra.execute("CREATE ROLE mike WITH PASSWORD = '12345' AND LOGIN = true")
-        cassandra.execute("CREATE FUNCTION ks.plus_one ( input int ) CALLED ON NULL INPUT RETURNS int LANGUAGE javascript AS 'input + 1'")
-        cassandra.execute("GRANT EXECUTE ON FUNCTION ks.plus_one(int) TO mike")
+        cassandra.execute("CREATE FUNCTION ks.state_func (a int, b int) CALLED ON NULL INPUT RETURNS int LANGUAGE javascript AS 'a + b'")
+        cassandra.execute("CREATE AGGREGATE ks.agg_func (int) SFUNC state_func STYPE int")
+        cassandra.execute("GRANT EXECUTE ON FUNCTION ks.state_func(int, int) TO mike")
+        cassandra.execute("GRANT EXECUTE ON FUNCTION ks.agg_func(int) TO mike")
 
-        self.assert_permissions_listed([("mike", "<function ks.plus_one(int)>", "EXECUTE")],
+        self.assert_permissions_listed([("mike", "<function ks.state_func(int, int)>", "EXECUTE"),
+                                        ("mike", "<function ks.agg_func(int)>", "EXECUTE")],
                                        cassandra,
                                        "LIST ALL PERMISSIONS OF mike")
         # drop the keyspace
@@ -2448,8 +2545,9 @@ class TestAuthRoles(Tester):
         * Launch a one node cluster
         * Connect as the default superuser
         * Create a new role, 'mike'
-        * Create two aggregate functions
-        * Verify all UDF permissions also apply to aggregates
+        * Create two UDFs, and use them as the state & final functions in a UDA
+        * Verify all UDF permissions also apply to UDAs
+        * Drop the UDA and ensure that the granted permissions are removed
         """
         self.prepare()
         cassandra = self.get_session(user='cassandra', password='cassandra')
@@ -2503,6 +2601,16 @@ class TestAuthRoles(Tester):
         # mike *does* have execute permission on the aggregate function, as its creator
         assert_one(mike, execute_aggregate_cql, [3])
 
+        # check that dropping the aggregate removes all of mike's permissions on it
+        # note: after dropping, we have to list *all* of mike's permissions and check
+        # that they don't contain any for the aggregate as we can no longer use the
+        # function name in the LIST statement
+        agg_perms = list(cassandra.execute("LIST ALL PERMISSIONS ON FUNCTION ks.simple_aggregate(int) OF mike NORECURSIVE"))
+        cassandra.execute("DROP AGGREGATE ks.simple_aggregate(int)")
+        all_perms = list(cassandra.execute("LIST ALL PERMISSIONS OF mike"))
+        for p in agg_perms:
+            self.assertFalse(p in all_perms, msg="Perm {p} found, but should be removed".format(p=p))
+
     def ignore_invalid_roles_test(self):
         """
         The system_auth.roles table includes a set of roles of which each role
@@ -2530,7 +2638,7 @@ class TestAuthRoles(Tester):
         host, error = response.exception.errors.popitem()
 
         message = "Provided username {user} and/or password are incorrect".format(user=user)\
-            if LooseVersion(node.cluster.version()) >= LooseVersion('3.10') \
+            if node.cluster.version() >= LooseVersion('3.10') \
             else "Username and/or password are incorrect"
         pattern = 'Failed to authenticate to {host}: Error from server: code=0100 ' \
                   '[Bad credentials] message="{message}"'.format(host=host, message=message)
@@ -2571,7 +2679,7 @@ class TestAuthRoles(Tester):
         self.cluster.set_configuration_options(values=config)
         self.cluster.populate(nodes).start(wait_for_binary_proto=True)
 
-        self.wait_for_any_log(self.cluster.nodelist(), 'Created default superuser', 25)
+        self.cluster.wait_for_any_log('Created default superuser', 25)
 
     def assert_permissions_listed(self, expected, session, query):
         rows = session.execute(query)

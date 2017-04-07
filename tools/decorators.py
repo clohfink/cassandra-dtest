@@ -1,13 +1,11 @@
 import functools
-import re
 import unittest
 from distutils.version import LooseVersion
 
 from nose.plugins.attrib import attr
 from nose.tools import assert_in, assert_is_instance
 
-from dtest import DISABLE_VNODES, IGNORE_REQUIRE
-from tools.git import cassandra_git_branch
+from dtest import DISABLE_VNODES
 
 
 class since(object):
@@ -29,8 +27,9 @@ class since(object):
 
         @functools.wraps(cls.setUp)
         def wrapped_setUp(obj, *args, **kwargs):
+            obj.max_version = self.max_version
             orig_setUp(obj, *args, **kwargs)
-            version = LooseVersion(obj.cluster.version())
+            version = obj.cluster.version()
             msg = self._skip_msg(version)
             if msg:
                 obj.skip(msg)
@@ -41,7 +40,8 @@ class since(object):
     def _wrap_function(self, f):
         @functools.wraps(f)
         def wrapped(obj):
-            version = LooseVersion(obj.cluster.version())
+            obj.max_version = self.max_version
+            version = obj.cluster.version()
             msg = self._skip_msg(version)
             if msg:
                 obj.skip(msg)
@@ -61,69 +61,6 @@ def no_vnodes():
     return unittest.skipIf(not DISABLE_VNODES, 'Test disabled for vnodes')
 
 
-def require(require_pattern, broken_in=None):
-    """
-    Skips the decorated class or method, unless the argument
-    'require_pattern' is a case-insensitive regex match for the name of the git
-    branch in the directory from which Cassandra is running. For example, the
-    method defined here:
-
-        @require('compaction-fixes')
-        def compaction_test(self):
-            ...
-
-    will run if Cassandra is running from a directory whose current git branch
-    is named 'compaction-fixes'. If 'require_pattern' were
-    '.*compaction-fixes.*', it would run only when Cassandra is being run from a
-    branch whose name contains 'compaction-fixes'.
-
-    To accommodate current branch-naming conventions, it also will run if the
-    current Cassandra branch matches 'CASSANDRA-{require_pattern}'. This allows
-    users to run tests like:
-
-        @require(4200)
-        class TestNewFeature(self):
-            ...
-
-    on branches named 'CASSANDRA-4200'.
-
-    If neither 'require_pattern' nor 'CASSANDRA-{require_pattern}' is a
-    case-insensitive match for the name of Cassandra's current git branch, the
-    test function or class will be skipped with unittest.skip.
-
-    To run decorated methods as if they were not decorated with @require, set
-    the environment variable IGNORE_REQUIRE to 'yes' or 'true'. To only run
-    methods decorated with require, set IGNORE_REQUIRE to 'yes' or 'true' and
-    run `nosetests` with `-a required`. (This uses the built-in `attrib`
-    plugin.)
-    """
-    tagging_decorator = attr('required')
-    if IGNORE_REQUIRE:
-        return tagging_decorator
-    require_pattern = str(require_pattern)
-    git_branch = ''
-    git_branch = cassandra_git_branch()
-
-    if git_branch:
-        git_branch = git_branch.lower()
-        run_on_branch_patterns = (require_pattern, 'cassandra-{b}'.format(b=require_pattern))
-        # always run the test if the git branch name matches
-        if any(re.match(p, git_branch, re.IGNORECASE) for p in run_on_branch_patterns):
-            return tagging_decorator
-        # if skipping a buggy/flapping test, use since
-        elif broken_in:
-            def tag_and_skip_after_version(decorated):
-                return since('0', broken_in)(tagging_decorator(decorated))
-            return tag_and_skip_after_version
-        # otherwise, skip with a message
-        else:
-            def tag_and_skip(decorated):
-                return unittest.skip('require ' + str(require_pattern))(tagging_decorator(decorated))
-            return tag_and_skip
-    else:
-        return tagging_decorator
-
-
 def known_failure(failure_source, jira_url, flaky=False, notes=''):
     """
     Tag a test as a known failure. Associate it with the URL for a JIRA
@@ -133,16 +70,14 @@ def known_failure(failure_source, jira_url, flaky=False, notes=''):
     'systemic'.
 
     To run all known failures, use the functionality provided by the nosetests
-    attrib plugin, using the known_failure and known_flaky attributes:
+    attrib plugin, using the known_failure attributes:
 
         # only run tests that are known to fail
         $ nosetests -a known_failure
         # only run tests that are not known to fail
         $ nosetests -a !known_failure
         # only run tests that fail because of cassandra bugs
-        $ nosetests -a known_failure=cassandra
-        # only run tests that fail because of cassandra bugs, but are not flaky
-        $ nosetests -a known_failure=cassandra -a !known_flaky
+        $ nosetests -A "'cassandra' in [d['failure_source'] for d in known_failure]"
 
     Known limitations: a given test may only be tagged once and still work as
     expected with the attrib plugin machinery; if you decorate a test with
@@ -155,11 +90,17 @@ def known_failure(failure_source, jira_url, flaky=False, notes=''):
         assert_in(failure_source, valid_failure_sources)
         assert_is_instance(flaky, bool)
 
-        tagged_func = attr(known_failure=failure_source,
-                           jira_url=jira_url)(f)
-        if flaky:
-            tagged_func = attr('known_flaky')(tagged_func)
+        try:
+            existing_failure_annotations = f.known_failure
+        except AttributeError:
+            existing_failure_annotations = []
 
-        tagged_func = attr(failure_notes=notes)(tagged_func)
+        new_annotation = [{'failure_source': failure_source, 'jira_url': jira_url, 'notes': notes, 'flaky': flaky}]
+
+        failure_annotations = existing_failure_annotations + new_annotation
+
+        tagged_func = attr(known_failure=failure_annotations)(f)
+
         return tagged_func
+
     return wrapper

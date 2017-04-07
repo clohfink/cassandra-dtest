@@ -9,8 +9,8 @@ from cassandra.query import SimpleStatement
 from ccmlib.node import Node, TimeoutError
 from nose.tools import timed
 
-from dtest import Tester, debug
-from tools.decorators import known_failure, no_vnodes, since
+from dtest import Tester, debug, get_ip_from_node, create_ks
+from tools.decorators import no_vnodes, since
 
 
 class NotificationWaiter(object):
@@ -82,9 +82,7 @@ class TestPushedNotifications(Tester):
     """
     Tests for pushed native protocol notification from Cassandra.
     """
-    @known_failure(failure_source='cassandra',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-12406',
-                   flaky=True)
+
     @no_vnodes()
     def move_single_node_test(self):
         """
@@ -114,7 +112,7 @@ class TestPushedNotifications(Tester):
             change_type = notification["change_type"]
             address, port = notification["address"]
             self.assertEquals("MOVED_NODE", change_type)
-            self.assertEquals(self.get_ip_from_node(node1), address)
+            self.assertEquals(get_ip_from_node(node1), address)
 
     @no_vnodes()
     def move_single_node_localhost_test(self):
@@ -170,7 +168,7 @@ class TestPushedNotifications(Tester):
 
         # On versions prior to 2.2, an additional NEW_NODE notification is sent when a node
         # is restarted. This bug was fixed in CASSANDRA-11038 (see also CASSANDRA-11360)
-        version = LooseVersion(self.cluster.cassandra_version())
+        version = self.cluster.cassandra_version()
         expected_notifications = 2 if version >= '2.2' else 3
         for i in range(5):
             debug("Restarting second node...")
@@ -180,11 +178,15 @@ class TestPushedNotifications(Tester):
             notifications = waiter.wait_for_notifications(timeout=60.0, num_notifications=expected_notifications)
             self.assertEquals(expected_notifications, len(notifications), notifications)
             for notification in notifications:
-                self.assertEquals(self.get_ip_from_node(node2), notification["address"][0])
+                self.assertEquals(get_ip_from_node(node2), notification["address"][0])
             self.assertEquals("DOWN", notifications[0]["change_type"])
-            self.assertEquals("UP", notifications[1]["change_type"])
-            if version < '2.2':
-                self.assertEquals("NEW_NODE", notifications[2]["change_type"])
+            if version >= '2.2':
+                self.assertEquals("UP", notifications[1]["change_type"])
+            else:
+                # pre 2.2, we'll receive both a NEW_NODE and an UP notification,
+                # but the order is not guaranteed
+                self.assertEquals({"NEW_NODE", "UP"}, set(map(lambda n: n["change_type"], notifications[1:])))
+
             waiter.clear_notifications()
 
     def restart_node_localhost_test(self):
@@ -233,15 +235,20 @@ class TestPushedNotifications(Tester):
         waiter.wait_for_notifications(timeout=30, num_notifications=2)
         waiter.clear_notifications()
 
+        session = self.patient_cql_connection(node1)
+        # reduce system_distributed RF to 2 so we don't require forceful decommission
+        session.execute("ALTER KEYSPACE system_distributed WITH REPLICATION = {'class':'SimpleStrategy', 'replication_factor':'1'};")
+        session.execute("ALTER KEYSPACE system_traces WITH REPLICATION = {'class':'SimpleStrategy', 'replication_factor':'1'};")
+
         debug("Adding second node...")
-        node2 = Node('node2', self.cluster, True, ('127.0.0.2', 9160), ('127.0.0.2', 7000), '7200', '0', None, ('127.0.0.2', 9042))
+        node2 = Node('node2', self.cluster, True, None, ('127.0.0.2', 7000), '7200', '0', None, binary_interface=('127.0.0.2', 9042))
         self.cluster.add(node2, False)
         node2.start(wait_other_notice=True)
         debug("Waiting for notifications from {}".format(waiter.address))
         notifications = waiter.wait_for_notifications(timeout=60.0, num_notifications=2)
         self.assertEquals(2, len(notifications), notifications)
         for notification in notifications:
-            self.assertEquals(self.get_ip_from_node(node2), notification["address"][0])
+            self.assertEquals(get_ip_from_node(node2), notification["address"][0])
             self.assertEquals("NEW_NODE", notifications[0]["change_type"])
             self.assertEquals("UP", notifications[1]["change_type"])
 
@@ -253,7 +260,7 @@ class TestPushedNotifications(Tester):
         notifications = waiter.wait_for_notifications(timeout=60.0, num_notifications=2)
         self.assertEquals(2, len(notifications), notifications)
         for notification in notifications:
-            self.assertEquals(self.get_ip_from_node(node2), notification["address"][0])
+            self.assertEquals(get_ip_from_node(node2), notification["address"][0])
             self.assertEquals("REMOVED_NODE", notifications[0]["change_type"])
             self.assertEquals("DOWN", notifications[1]["change_type"])
 
@@ -266,8 +273,9 @@ class TestPushedNotifications(Tester):
         i = 0
         for node in cluster.nodelist():
             debug('Set 127.0.0.1 to prevent IPv6 java prefs, set rpc_address: localhost in cassandra.yaml')
-            node.network_interfaces['thrift'] = ('127.0.0.1', node.network_interfaces['thrift'][1] + i)
-            node.network_interfaces['binary'] = ('127.0.0.1', node.network_interfaces['thrift'][1] + 1)
+            if cluster.version() < '4':
+                node.network_interfaces['thrift'] = ('127.0.0.1', node.network_interfaces['thrift'][1] + i)
+            node.network_interfaces['binary'] = ('127.0.0.1', node.network_interfaces['binary'][1] + i)
             node.import_config_files()  # this regenerates the yaml file and sets 'rpc_address' to the 'thrift' address
             node.set_configuration_options(values={'rpc_address': 'localhost'})
             debug(node.show())
@@ -287,7 +295,7 @@ class TestPushedNotifications(Tester):
         session = self.patient_cql_connection(node1)
         waiter = NotificationWaiter(self, node2, ["SCHEMA_CHANGE"], keyspace='ks')
 
-        self.create_ks(session, 'ks', 3)
+        create_ks(session, 'ks', 3)
         session.execute("create TABLE t (k int PRIMARY KEY , v int)")
         session.execute("alter TABLE t add v1 int;")
 
@@ -325,7 +333,7 @@ class TestVariousNotifications(Tester):
         @jira_ticket CASSANDRA-7886
         """
 
-        have_v5_protocol = LooseVersion(self.cluster.version()) >= LooseVersion('3.10')
+        have_v5_protocol = self.cluster.version() >= LooseVersion('3.10')
 
         self.allow_log_errors = True
         self.cluster.set_configuration_options(
@@ -340,7 +348,7 @@ class TestVariousNotifications(Tester):
         proto_version = 5 if have_v5_protocol else None
         session = self.patient_cql_connection(node1, protocol_version=proto_version)
 
-        self.create_ks(session, 'test', 3)
+        create_ks(session, 'test', 3)
         session.execute(
             "CREATE TABLE test ( "
             "id int, mytext text, col1 int, col2 int, col3 int, "

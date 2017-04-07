@@ -10,7 +10,8 @@ from cassandra.policies import FallthroughRetryPolicy
 from cassandra.protocol import ProtocolException
 from cassandra.query import SimpleStatement
 
-from dtest import Tester, canReuseCluster, debug, freshCluster
+from dtest import ReusableClusterTester, debug, Tester, create_ks
+from distutils.version import LooseVersion
 from thrift_bindings.v22.ttypes import \
     ConsistencyLevel as ThriftConsistencyLevel
 from thrift_bindings.v22.ttypes import (CfDef, Column, ColumnOrSuperColumn,
@@ -52,11 +53,10 @@ class CQLTester(Tester):
 
         session = self.patient_cql_connection(node1, protocol_version=protocol_version, user=user, password=password)
         if create_keyspace:
-            self.create_ks(session, 'ks', rf)
+            create_ks(session, 'ks', rf)
         return session
 
 
-@canReuseCluster
 class StorageProxyCQLTester(CQLTester):
     """
     Each CQL statement is exercised at least once in order to
@@ -94,7 +94,7 @@ class StorageProxyCQLTester(CQLTester):
         self.assertIsInstance(ks_meta.replication_strategy, SimpleStrategy)
 
         session.execute("ALTER KEYSPACE ks WITH replication = "
-                        "{ 'class' : 'NetworkTopologyStrategy', 'dc1' : 1 } "
+                        "{ 'class' : 'NetworkTopologyStrategy', 'datacenter1' : 1 } "
                         "AND DURABLE_WRITES = false")
         self.assertFalse(ks_meta.durable_writes)
         self.assertIsInstance(ks_meta.replication_strategy, NetworkTopologyStrategy)
@@ -285,6 +285,140 @@ class StorageProxyCQLTester(CQLTester):
 
         assert_one(session, "SELECT COUNT(*) FROM test7 WHERE kind = 'ev1'", [0])
 
+    @since('3.10')
+    def partition_key_allow_filtering_test(self):
+        """
+        Filtering with unrestricted parts of partition keys
+
+        @jira_ticket CASSANDRA-11031
+        """
+        session = self.prepare()
+
+        session.execute("""
+            CREATE TABLE IF NOT EXISTS test_filter (
+                k1 int,
+                k2 int,
+                ck1 int,
+                v int,
+                PRIMARY KEY ((k1, k2), ck1)
+            )
+        """)
+
+        session.execute("INSERT INTO test_filter (k1, k2, ck1, v) VALUES (0, 0, 0, 0)")
+        session.execute("INSERT INTO test_filter (k1, k2, ck1, v) VALUES (0, 0, 1, 0)")
+        session.execute("INSERT INTO test_filter (k1, k2, ck1, v) VALUES (0, 0, 2, 0)")
+        session.execute("INSERT INTO test_filter (k1, k2, ck1, v) VALUES (0, 0, 3, 0)")
+        session.execute("INSERT INTO test_filter (k1, k2, ck1, v) VALUES (0, 1, 0, 0)")
+        session.execute("INSERT INTO test_filter (k1, k2, ck1, v) VALUES (0, 1, 1, 0)")
+        session.execute("INSERT INTO test_filter (k1, k2, ck1, v) VALUES (0, 1, 2, 0)")
+        session.execute("INSERT INTO test_filter (k1, k2, ck1, v) VALUES (0, 1, 3, 0)")
+        session.execute("INSERT INTO test_filter (k1, k2, ck1, v) VALUES (1, 0, 0, 0)")
+        session.execute("INSERT INTO test_filter (k1, k2, ck1, v) VALUES (1, 0, 1, 0)")
+        session.execute("INSERT INTO test_filter (k1, k2, ck1, v) VALUES (1, 0, 2, 0)")
+        session.execute("INSERT INTO test_filter (k1, k2, ck1, v) VALUES (1, 0, 3, 0)")
+        session.execute("INSERT INTO test_filter (k1, k2, ck1, v) VALUES (1, 1, 0, 0)")
+        session.execute("INSERT INTO test_filter (k1, k2, ck1, v) VALUES (1, 1, 1, 0)")
+        session.execute("INSERT INTO test_filter (k1, k2, ck1, v) VALUES (1, 1, 2, 0)")
+        session.execute("INSERT INTO test_filter (k1, k2, ck1, v) VALUES (1, 1, 3, 0)")
+
+        # select test
+        assert_all(session,
+                   "SELECT * FROM test_filter WHERE k1 = 0 ALLOW FILTERING",
+                   [[0, 0, 0, 0],
+                    [0, 0, 1, 0],
+                    [0, 0, 2, 0],
+                    [0, 0, 3, 0],
+                    [0, 1, 0, 0],
+                    [0, 1, 1, 0],
+                    [0, 1, 2, 0],
+                    [0, 1, 3, 0]],
+                   ignore_order=True)
+
+        assert_all(session,
+                   "SELECT * FROM test_filter WHERE k1 <= 1 AND k2 >= 1 ALLOW FILTERING",
+                   [[0, 1, 0, 0],
+                    [0, 1, 1, 0],
+                    [0, 1, 2, 0],
+                    [0, 1, 3, 0],
+                    [1, 1, 0, 0],
+                    [1, 1, 1, 0],
+                    [1, 1, 2, 0],
+                    [1, 1, 3, 0]],
+                   ignore_order=True)
+
+        assert_none(session, "SELECT * FROM test_filter WHERE k1 = 2 ALLOW FILTERING")
+        assert_none(session, "SELECT * FROM test_filter WHERE k1 <=0 AND k2 > 1 ALLOW FILTERING")
+
+        assert_all(session,
+                   "SELECT * FROM test_filter WHERE k2 <= 0 ALLOW FILTERING",
+                   [[0, 0, 0, 0],
+                    [0, 0, 1, 0],
+                    [0, 0, 2, 0],
+                    [0, 0, 3, 0],
+                    [1, 0, 0, 0],
+                    [1, 0, 1, 0],
+                    [1, 0, 2, 0],
+                    [1, 0, 3, 0]],
+                   ignore_order=True)
+
+        assert_all(session,
+                   "SELECT * FROM test_filter WHERE k1 <= 0 AND k2 = 0 ALLOW FILTERING",
+                   [[0, 0, 0, 0],
+                    [0, 0, 1, 0],
+                    [0, 0, 2, 0],
+                    [0, 0, 3, 0]])
+
+        assert_all(session,
+                   "SELECT * FROM test_filter WHERE k2 = 1 ALLOW FILTERING",
+                   [[0, 1, 0, 0],
+                    [0, 1, 1, 0],
+                    [0, 1, 2, 0],
+                    [0, 1, 3, 0],
+                    [1, 1, 0, 0],
+                    [1, 1, 1, 0],
+                    [1, 1, 2, 0],
+                    [1, 1, 3, 0]],
+                   ignore_order=True)
+
+        assert_none(session, "SELECT * FROM test_filter WHERE k2 = 2 ALLOW FILTERING")
+
+        # filtering on both Partition Key and Clustering key
+        assert_all(session,
+                   "SELECT * FROM test_filter WHERE k1 = 0 AND ck1=0 ALLOW FILTERING",
+                   [[0, 0, 0, 0],
+                    [0, 1, 0, 0]],
+                   ignore_order=True)
+
+        assert_all(session,
+                   "SELECT * FROM test_filter WHERE k1 = 0 AND k2=1 AND ck1=0 ALLOW FILTERING",
+                   [[0, 1, 0, 0]])
+
+        # count(*) test
+        assert_all(session,
+                   "SELECT count(*) FROM test_filter WHERE k2 = 0 ALLOW FILTERING",
+                   [[8]])
+
+        assert_all(session,
+                   "SELECT count(*) FROM test_filter WHERE k2 = 1 ALLOW FILTERING",
+                   [[8]])
+
+        assert_all(session,
+                   "SELECT count(*) FROM test_filter WHERE k2 = 2 ALLOW FILTERING",
+                   [[0]])
+
+        # test invalid query
+        with self.assertRaises(InvalidRequest):
+            session.execute("SELECT * FROM test_filter WHERE k1 = 0")
+
+        with self.assertRaises(InvalidRequest):
+            session.execute("SELECT * FROM test_filter WHERE k1 = 0 AND k2 > 0")
+
+        with self.assertRaises(InvalidRequest):
+            session.execute("SELECT * FROM test_filter WHERE k1 >= 0 AND k2 in (0,1,2)")
+
+        with self.assertRaises(InvalidRequest):
+            session.execute("SELECT * FROM test_filter WHERE k2 > 0")
+
     def batch_test(self):
         """
         Smoke test for BATCH statements:
@@ -314,7 +448,6 @@ class StorageProxyCQLTester(CQLTester):
         session.execute(query)
 
 
-@canReuseCluster
 class MiscellaneousCQLTester(CQLTester):
     """
     CQL tests that cannot be performed as Java unit tests, see CASSANDRA-9160.
@@ -361,6 +494,7 @@ class MiscellaneousCQLTester(CQLTester):
                             "Only the first 65535 elements will be returned to the client. Please see "
                             "http://cassandra.apache.org/doc/cql3/CQL.html#collections for more details.")
 
+    @since('2.0', max_version='4')
     def cql3_insert_thrift_test(self):
         """
         Check that we can insert from thrift into a CQL3 table:
@@ -398,6 +532,7 @@ class MiscellaneousCQLTester(CQLTester):
 
         assert_one(session, "SELECT * FROM test", [2, 4, 8])
 
+    @since('2.0', max_version='4')
     def rename_test(self):
         """
         Check that a thrift-created table can be renamed via CQL:
@@ -442,7 +577,7 @@ class MiscellaneousCQLTester(CQLTester):
         # this should fail as normal, not with a ProtocolException
         assert_invalid(session, u"insert into invalid_string_literals (k, a) VALUES (0, '\u038E\u0394\u03B4\u03E0')")
 
-        session = self.cql_connection(self.cluster.nodelist()[0], keyspace='ks')
+        session = self.patient_cql_connection(self.cluster.nodelist()[0], keyspace='ks')
         session.execute("create table invalid_string_literals (k int primary key, a ascii, b text)")
 
         # this should still fail with an InvalidRequest
@@ -491,18 +626,18 @@ class MiscellaneousCQLTester(CQLTester):
         result = session.execute(wildcard_prepared.bind(None))
         self.assertEqual(result, [(0, 0, 0, None)])
 
-        explicit_prepared = session.prepare("SELECT k, a, b, d FROM test")
+        if self.cluster.version() < LooseVersion('3.0'):
+            explicit_prepared = session.prepare("SELECT k, a, b, d FROM test")
 
-        # when the type is altered, both statements will need to be re-prepared
-        # by the driver, but the re-preparation should succeed
-        session.execute("ALTER TABLE test ALTER d TYPE blob")
-        result = session.execute(wildcard_prepared.bind(None))
-        self.assertEqual(result, [(0, 0, 0, None)])
+            # when the type is altered, both statements will need to be re-prepared
+            # by the driver, but the re-preparation should succeed
+            session.execute("ALTER TABLE test ALTER d TYPE blob")
+            result = session.execute(wildcard_prepared.bind(None))
+            self.assertEqual(result, [(0, 0, 0, None)])
 
-        result = session.execute(explicit_prepared.bind(None))
-        self.assertEqual(result, [(0, 0, 0, None)])
+            result = session.execute(explicit_prepared.bind(None))
+            self.assertEqual(result, [(0, 0, 0, None)])
 
-    @freshCluster()
     def range_slice_test(self):
         """
         Regression test for CASSANDRA-1337:
@@ -523,7 +658,7 @@ class MiscellaneousCQLTester(CQLTester):
         time.sleep(0.2)
 
         session = self.patient_cql_connection(node1)
-        self.create_ks(session, 'ks', 1)
+        create_ks(session, 'ks', 1)
 
         session.execute("""
             CREATE TABLE test (
@@ -565,7 +700,7 @@ class MiscellaneousCQLTester(CQLTester):
 
 
 @since('3.2')
-class AbortedQueriesTester(CQLTester):
+class AbortedQueryTester(CQLTester):
     """
     @jira_ticket CASSANDRA-7392
 
@@ -584,28 +719,31 @@ class AbortedQueriesTester(CQLTester):
         """
         Check that a query running on the local coordinator node times out:
 
-        - set a 1-second read timeout
-        - start the cluster with read_iteration_delay set to 1.5 seconds
-            - (this will cause read queries to take longer than the read timeout)
+        - set the read request timeouts to 1 second
+        - start the cluster with read_iteration_delay set to 5 ms
+            - the delay will be applied ot each row iterated and will cause
+              read queries to take longer than the read timeout
         - CREATE and INSERT into a table
         - SELECT * from the table using a retry policy that never retries, and assert it times out
 
         @jira_ticket CASSANDRA-7392
         """
         cluster = self.cluster
-        cluster.set_configuration_options(values={'read_request_timeout_in_ms': 1000})
+        cluster.set_configuration_options(values={'request_timeout_in_ms': 1000,
+                                                  'read_request_timeout_in_ms': 1000,
+                                                  'range_request_timeout_in_ms': 1000})
 
         # cassandra.test.read_iteration_delay_ms causes the state tracking read iterators
-        # introduced by CASSANDRA-7392 to pause by the specified amount of milliseconds during each
-        # iteration of non system queries, so that these queries take much longer to complete,
+        # introduced by CASSANDRA-7392 to pause by the specified amount of milliseconds every
+        # CQL row iterated for non system queries, so that these queries take much longer to complete,
         # see ReadCommand.withStateTracking()
         cluster.populate(1).start(wait_for_binary_proto=True,
-                                  jvm_args=["-Dcassandra.monitoring_check_interval_ms=50",
-                                            "-Dcassandra.test.read_iteration_delay_ms=1500"])
+                                  jvm_args=["-Dcassandra.monitoring_report_interval_ms=10",
+                                            "-Dcassandra.test.read_iteration_delay_ms=5"])
         node = cluster.nodelist()[0]
         session = self.patient_cql_connection(node)
 
-        self.create_ks(session, 'ks', 1)
+        create_ks(session, 'ks', 1)
         session.execute("""
             CREATE TABLE test1 (
                 id int PRIMARY KEY,
@@ -616,22 +754,24 @@ class AbortedQueriesTester(CQLTester):
         for i in range(500):
             session.execute("INSERT INTO test1 (id, val) VALUES ({}, 'foo')".format(i))
 
-        mark = node.mark_log()
+        # use debug logs because at info level no-spam logger has unpredictable results
+        mark = node.mark_log(filename='debug.log')
         statement = SimpleStatement("SELECT * from test1",
                                     consistency_level=ConsistencyLevel.ONE,
                                     retry_policy=FallthroughRetryPolicy())
         assert_unavailable(lambda c: debug(c.execute(statement)), session)
-        node.watch_log_for("operations timed out", from_mark=mark, timeout=60)
+        node.watch_log_for("operations timed out", filename='debug.log', from_mark=mark, timeout=60)
 
     def remote_query_test(self):
         """
         Check that a query running on a node other than the coordinator times out:
 
         - populate the cluster with 2 nodes
-        - set a 1-second read timeout
+        - set the read request timeouts to 1 second
         - start one node without having it join the ring
-        - start the other node with read_iteration_delay set to 1.5 seconds
-            - (this will cause read queries to take longer than the read timeout)
+        - start the other node with read_iteration_delay set to 5 ms
+            - the delay will be applied ot each row iterated and will cause
+              read queries to take longer than the read timeout
         - CREATE a table
         - INSERT 5000 rows on a session on the node that is not a member of the ring
         - run SELECT statements and assert they fail
@@ -641,19 +781,21 @@ class AbortedQueriesTester(CQLTester):
         #        - assert we raise the right error
         """
         cluster = self.cluster
-        cluster.set_configuration_options(values={'read_request_timeout_in_ms': 1000})
+        cluster.set_configuration_options(values={'request_timeout_in_ms': 1000,
+                                                  'read_request_timeout_in_ms': 1000,
+                                                  'range_request_timeout_in_ms': 1000})
 
         cluster.populate(2)
         node1, node2 = cluster.nodelist()
 
         node1.start(wait_for_binary_proto=True, join_ring=False)  # ensure other node executes queries
         node2.start(wait_for_binary_proto=True,
-                    jvm_args=["-Dcassandra.monitoring_check_interval_ms=50",
-                              "-Dcassandra.test.read_iteration_delay_ms=1500"])  # see above for explanation
+                    jvm_args=["-Dcassandra.monitoring_report_interval_ms=10",
+                              "-Dcassandra.test.read_iteration_delay_ms=5"])  # see above for explanation
 
         session = self.patient_exclusive_cql_connection(node1)
 
-        self.create_ks(session, 'ks', 1)
+        create_ks(session, 'ks', 1)
         session.execute("""
             CREATE TABLE test2 (
                 id int,
@@ -663,10 +805,11 @@ class AbortedQueriesTester(CQLTester):
             );
         """)
 
-        for i, j in itertools.product(range(500), range(10)):
+        for i, j in itertools.product(range(10), range(500)):
             session.execute("INSERT INTO test2 (id, col, val) VALUES ({}, {}, 'foo')".format(i, j))
 
-        mark = node2.mark_log()
+        # use debug logs because at info level no-spam logger has unpredictable results
+        mark = node2.mark_log(filename='debug.log')
 
         statement = SimpleStatement("SELECT * from test2",
                                     consistency_level=ConsistencyLevel.ONE,
@@ -678,7 +821,7 @@ class AbortedQueriesTester(CQLTester):
                                     retry_policy=FallthroughRetryPolicy())
         assert_unavailable(lambda c: debug(c.execute(statement)), session)
 
-        statement = SimpleStatement("SELECT * from test2 where id IN (1, 10,  20) AND col < 10",
+        statement = SimpleStatement("SELECT * from test2 where id IN (1, 2, 3) AND col > 10",
                                     consistency_level=ConsistencyLevel.ONE,
                                     retry_policy=FallthroughRetryPolicy())
         assert_unavailable(lambda c: debug(c.execute(statement)), session)
@@ -688,32 +831,35 @@ class AbortedQueriesTester(CQLTester):
                                     retry_policy=FallthroughRetryPolicy())
         assert_unavailable(lambda c: debug(c.execute(statement)), session)
 
-        node2.watch_log_for("operations timed out", from_mark=mark, timeout=60)
+        node2.watch_log_for("operations timed out", filename='debug.log', from_mark=mark, timeout=60)
 
     def index_query_test(self):
         """
         Check that a secondary index query times out:
 
         - populate a 1-node cluster
-        - set a 1-second read timeout
+        - set the read request timeouts to 1 second
         - start one node without having it join the ring
-        - start the other node with read_iteration_delay set to 1.5 seconds
-            - (this will cause read queries to take longer than the read timeout)
+        - start the other node with read_iteration_delay set to 5 ms
+            - the delay will be applied ot each row iterated and will cause
+              read queries to take longer than the read timeout
         - CREATE a table
         - CREATE an index on the table
         - INSERT 500 values into the table
         - SELECT over the table and assert it times out
         """
         cluster = self.cluster
-        cluster.set_configuration_options(values={'read_request_timeout_in_ms': 1000})
+        cluster.set_configuration_options(values={'request_timeout_in_ms': 1000,
+                                                  'read_request_timeout_in_ms': 1000,
+                                                  'range_request_timeout_in_ms': 1000})
 
         cluster.populate(1).start(wait_for_binary_proto=True,
-                                  jvm_args=["-Dcassandra.monitoring_check_interval_ms=50",
-                                            "-Dcassandra.test.read_iteration_delay_ms=1500"])  # see above for explanation
+                                  jvm_args=["-Dcassandra.monitoring_report_interval_ms=10",
+                                            "-Dcassandra.test.read_iteration_delay_ms=5"])  # see above for explanation
         node = cluster.nodelist()[0]
         session = self.patient_cql_connection(node)
 
-        self.create_ks(session, 'ks', 1)
+        create_ks(session, 'ks', 1)
         session.execute("""
             CREATE TABLE test3 (
                 id int PRIMARY KEY,
@@ -725,43 +871,47 @@ class AbortedQueriesTester(CQLTester):
         session.execute("CREATE INDEX ON test3 (col)")
 
         for i in range(500):
-            session.execute("INSERT INTO test3 (id, col, val) VALUES ({}, {}, 'foo')".format(i, i // 10))
+            session.execute("INSERT INTO test3 (id, col, val) VALUES ({}, 50, 'foo')".format(i))
 
-        mark = node.mark_log()
-        statement = session.prepare("SELECT * from test3 WHERE col < ? ALLOW FILTERING")
+        # use debug logs because at info level no-spam logger has unpredictable results
+        mark = node.mark_log(filename='debug.log')
+        statement = session.prepare("SELECT * from test3 WHERE col = ? ALLOW FILTERING")
         statement.consistency_level = ConsistencyLevel.ONE
         statement.retry_policy = FallthroughRetryPolicy()
         assert_unavailable(lambda c: debug(c.execute(statement, [50])), session)
-        node.watch_log_for("operations timed out", from_mark=mark, timeout=60)
+        node.watch_log_for("operations timed out", filename='debug.log', from_mark=mark, timeout=60)
 
     def materialized_view_test(self):
         """
         Check that a materialized view query times out:
 
         - populate a 2-node cluster
-        - set a 1-second read timeout
+        - set the read request timeouts to 1 second
         - start one node without having it join the ring
-        - start the other node with read_iteration_delay set to 1.5 seconds
-            - (this will cause read queries to take longer than the read timeout)
+        - start the other node with read_iteration_delay set to 5 ms
+            - the delay will be applied ot each row iterated and will cause
+              read queries to take longer than the read timeout
         - CREATE a table
+        - INSERT 500 values into that table
         - CREATE a materialized view over that table
-        - INSERT 50 values into that table
         - assert querying that table results in an unavailable exception
         """
         cluster = self.cluster
-        cluster.set_configuration_options(values={'read_request_timeout_in_ms': 1000})
+        cluster.set_configuration_options(values={'request_timeout_in_ms': 1000,
+                                                  'read_request_timeout_in_ms': 1000,
+                                                  'range_request_timeout_in_ms': 1000})
 
         cluster.populate(2)
         node1, node2 = cluster.nodelist()
 
         node1.start(wait_for_binary_proto=True, join_ring=False)  # ensure other node executes queries
         node2.start(wait_for_binary_proto=True,
-                    jvm_args=["-Dcassandra.monitoring_check_interval_ms=50",
-                              "-Dcassandra.test.read_iteration_delay_ms=1500"])  # see above for explanation
+                    jvm_args=["-Dcassandra.monitoring_report_interval_ms=10",
+                              "-Dcassandra.test.read_iteration_delay_ms=5"])  # see above for explanation
 
         session = self.patient_exclusive_cql_connection(node1)
 
-        self.create_ks(session, 'ks', 1)
+        create_ks(session, 'ks', 1)
         session.execute("""
             CREATE TABLE test4 (
                 id int PRIMARY KEY,
@@ -773,15 +923,17 @@ class AbortedQueriesTester(CQLTester):
         session.execute(("CREATE MATERIALIZED VIEW mv AS SELECT * FROM test4 "
                          "WHERE col IS NOT NULL AND id IS NOT NULL PRIMARY KEY (col, id)"))
 
-        for i in range(50):
-            session.execute("INSERT INTO test4 (id, col, val) VALUES ({}, {}, 'foo')".format(i, i // 10))
+        for i in range(500):
+            session.execute("INSERT INTO test4 (id, col, val) VALUES ({}, 50, 'foo')".format(i))
 
-        mark = node2.mark_log()
+        # use debug logs because at info level no-spam logger has unpredictable results
+        mark = node2.mark_log(filename='debug.log')
         statement = SimpleStatement("SELECT * FROM mv WHERE col = 50",
                                     consistency_level=ConsistencyLevel.ONE,
                                     retry_policy=FallthroughRetryPolicy())
+
         assert_unavailable(lambda c: debug(c.execute(statement)), session)
-        node2.watch_log_for("operations timed out", from_mark=mark, timeout=60)
+        node2.watch_log_for("operations timed out", filename='debug.log', from_mark=mark, timeout=60)
 
 
 @since('3.10')
@@ -796,61 +948,78 @@ class SlowQueryTester(CQLTester):
         Check that a query running locally on the coordinator is reported as slow:
 
         - start a one node cluster with slow_query_log_timeout_in_ms set to a small value
-          and read_request_timeout_in_ms set to a large value (to ensure the query is not aborted) and
+          and the read request timeouts set to a large value (to ensure the query is not aborted) and
           read_iteration_delay set to a value big enough for the query to exceed slow_query_log_timeout_in_ms
           (this will cause read queries to take longer than the slow query timeout)
         - CREATE and INSERT into a table
         - SELECT * from the table using a retry policy that never retries, and check that the slow
-          query log messages are present in the logs
+          query log messages are present in the debug logs (we cannot check the logs at info level because
+          the no spam logger has unpredictable results)
 
         @jira_ticket CASSANDRA-12403
         """
         cluster = self.cluster
-        cluster.set_configuration_options(values={'slow_query_log_timeout_in_ms': 30,
-                                                  'read_request_timeout_in_ms': 60000})
+        cluster.set_configuration_options(values={'slow_query_log_timeout_in_ms': 10,
+                                                  'request_timeout_in_ms': 120000,
+                                                  'read_request_timeout_in_ms': 120000,
+                                                  'range_request_timeout_in_ms': 120000})
 
         # cassandra.test.read_iteration_delay_ms causes the state tracking read iterators
         # introduced by CASSANDRA-7392 to pause by the specified amount of milliseconds during each
         # iteration of non system queries, so that these queries take much longer to complete,
         # see ReadCommand.withStateTracking()
         cluster.populate(1).start(wait_for_binary_proto=True,
-                                  jvm_args=["-Dcassandra.monitoring_check_interval_ms=50",
-                                            "-Dcassandra.test.read_iteration_delay_ms=50"])
+                                  jvm_args=["-Dcassandra.monitoring_report_interval_ms=10",
+                                            "-Dcassandra.test.read_iteration_delay_ms=1"])
         node = cluster.nodelist()[0]
         session = self.patient_cql_connection(node)
 
-        self.create_ks(session, 'ks', 1)
+        create_ks(session, 'ks', 1)
         session.execute("""
             CREATE TABLE test1 (
-                id int PRIMARY KEY,
-                val text
+                id int,
+                col int,
+                val text,
+                PRIMARY KEY(id, col)
             );
         """)
 
         for i in range(100):
-            session.execute("INSERT INTO test1 (id, val) VALUES ({}, 'foo')".format(i))
+            session.execute("INSERT INTO test1 (id, col, val) VALUES (1, {}, 'foo')".format(i))
 
-        mark = node.mark_log(filename='system.log')
-        debug_mark = node.mark_log(filename='debug.log')
+        # only check debug logs because at INFO level the no-spam logger has unpredictable results
+        mark = node.mark_log(filename='debug.log')
 
         session.execute(SimpleStatement("SELECT * from test1",
                                         consistency_level=ConsistencyLevel.ONE,
                                         retry_policy=FallthroughRetryPolicy()))
 
-        session.execute(SimpleStatement("SELECT * from test1 where id = 1",
-                                        consistency_level=ConsistencyLevel.ONE,
-                                        retry_policy=FallthroughRetryPolicy()))
+        node.watch_log_for(["operations were slow", "SELECT \* FROM ks.test1"],
+                           from_mark=mark, filename='debug.log', timeout=60)
+        mark = node.mark_log(filename='debug.log')
 
         session.execute(SimpleStatement("SELECT * from test1 where id = 1",
                                         consistency_level=ConsistencyLevel.ONE,
                                         retry_policy=FallthroughRetryPolicy()))
 
-        session.execute(SimpleStatement("SELECT * from test1 where token(id) > 0",
+        node.watch_log_for(["operations were slow", "SELECT \* FROM ks.test1"],
+                           from_mark=mark, filename='debug.log', timeout=60)
+        mark = node.mark_log(filename='debug.log')
+
+        session.execute(SimpleStatement("SELECT * from test1 where id = 1",
                                         consistency_level=ConsistencyLevel.ONE,
                                         retry_policy=FallthroughRetryPolicy()))
 
-        node.watch_log_for("operations were slow", from_mark=mark, filename='system.log', timeout=60)
-        node.watch_log_for("SELECT \* FROM ks.test1", from_mark=debug_mark, filename='debug.log', timeout=60)
+        node.watch_log_for(["operations were slow", "SELECT \* FROM ks.test1"],
+                           from_mark=mark, filename='debug.log', timeout=60)
+        mark = node.mark_log(filename='debug.log')
+
+        session.execute(SimpleStatement("SELECT * from test1 where token(id) < 0",
+                                        consistency_level=ConsistencyLevel.ONE,
+                                        retry_policy=FallthroughRetryPolicy()))
+
+        node.watch_log_for(["operations were slow", "SELECT \* FROM ks.test1"],
+                           from_mark=mark, filename='debug.log', timeout=60)
 
     def remote_query_test(self):
         """
@@ -859,30 +1028,33 @@ class SlowQueryTester(CQLTester):
         - populate the cluster with 2 nodes
         - start one node without having it join the ring
         - start the other one node with slow_query_log_timeout_in_ms set to a small value
-          and read_request_timeout_in_ms set to a large value (to ensure the query is not aborted) and
+          and the read request timeouts set to a large value (to ensure the query is not aborted) and
           read_iteration_delay set to a value big enough for the query to exceed slow_query_log_timeout_in_ms
           (this will cause read queries to take longer than the slow query timeout)
         - CREATE a table
         - INSERT 5000 rows on a session on the node that is not a member of the ring
-        - run SELECT statements and check that the slow query messages are present in the logs
+        - run SELECT statements and check that the slow query messages are present in the debug logs
+          (we cannot check the logs at info level because the no spam logger has unpredictable results)
 
         @jira_ticket CASSANDRA-12403
         """
         cluster = self.cluster
-        cluster.set_configuration_options(values={'slow_query_log_timeout_in_ms': 30,
-                                                  'read_request_timeout_in_ms': 60000})
+        cluster.set_configuration_options(values={'slow_query_log_timeout_in_ms': 10,
+                                                  'request_timeout_in_ms': 120000,
+                                                  'read_request_timeout_in_ms': 120000,
+                                                  'range_request_timeout_in_ms': 120000})
 
         cluster.populate(2)
         node1, node2 = cluster.nodelist()
 
         node1.start(wait_for_binary_proto=True, join_ring=False)  # ensure other node executes queries
         node2.start(wait_for_binary_proto=True,
-                    jvm_args=["-Dcassandra.monitoring_check_interval_ms=50",
-                              "-Dcassandra.test.read_iteration_delay_ms=50"])  # see above for explanation
+                    jvm_args=["-Dcassandra.monitoring_report_interval_ms=10",
+                              "-Dcassandra.test.read_iteration_delay_ms=1"])  # see above for explanation
 
         session = self.patient_exclusive_cql_connection(node1)
 
-        self.create_ks(session, 'ks', 1)
+        create_ks(session, 'ks', 1)
         session.execute("""
             CREATE TABLE test2 (
                 id int,
@@ -895,35 +1067,46 @@ class SlowQueryTester(CQLTester):
         for i, j in itertools.product(range(100), range(10)):
             session.execute("INSERT INTO test2 (id, col, val) VALUES ({}, {}, 'foo')".format(i, j))
 
-        mark = node2.mark_log(filename='system.log')
-        debug_mark = node2.mark_log(filename='debug.log')
-
+        # only check debug logs because at INFO level the no-spam logger has unpredictable results
+        mark = node2.mark_log(filename='debug.log')
         session.execute(SimpleStatement("SELECT * from test2",
                                         consistency_level=ConsistencyLevel.ONE,
                                         retry_policy=FallthroughRetryPolicy()))
 
-        session.execute(SimpleStatement("SELECT * from test2 where id = 1",
-                                        consistency_level=ConsistencyLevel.ONE,
-                                        retry_policy=FallthroughRetryPolicy()))
+        node2.watch_log_for(["operations were slow", "SELECT \* FROM ks.test2"],
+                            from_mark=mark, filename='debug.log', timeout=60)
+        mark = node2.mark_log(filename='debug.log')
 
         session.execute(SimpleStatement("SELECT * from test2 where id = 1",
                                         consistency_level=ConsistencyLevel.ONE,
                                         retry_policy=FallthroughRetryPolicy()))
 
-        session.execute(SimpleStatement("SELECT * from test2 where token(id) > 0",
+        node2.watch_log_for(["operations were slow", "SELECT \* FROM ks.test2"],
+                            from_mark=mark, filename='debug.log', timeout=60)
+        mark = node2.mark_log(filename='debug.log')
+
+        session.execute(SimpleStatement("SELECT * from test2 where id = 1",
                                         consistency_level=ConsistencyLevel.ONE,
                                         retry_policy=FallthroughRetryPolicy()))
 
-        node2.watch_log_for("operations were slow", from_mark=mark, filename='system.log', timeout=60)
-        node2.watch_log_for("SELECT \* FROM ks.test2", from_mark=debug_mark, filename='debug.log', timeout=60)
+        node2.watch_log_for(["operations were slow", "SELECT \* FROM ks.test2"],
+                            from_mark=mark, filename='debug.log', timeout=60)
+        mark = node2.mark_log(filename='debug.log')
+
+        session.execute(SimpleStatement("SELECT * from test2 where token(id) < 0",
+                                        consistency_level=ConsistencyLevel.ONE,
+                                        retry_policy=FallthroughRetryPolicy()))
+
+        node2.watch_log_for(["operations were slow", "SELECT \* FROM ks.test2"],
+                            from_mark=mark, filename='debug.log', timeout=60)
 
     def disable_slow_query_log_test(self):
         """
         Check that a query is NOT reported as slow if slow query logging is disabled.
 
         - start a one node cluster with slow_query_log_timeout_in_ms set to 0 milliseconds
-          (this will disable slow query logging), read_request_timeout_in_ms set to a large value
-          (to ensure queries are not aborted) and read_iteration_delay set to 30 milliseconds
+          (this will disable slow query logging), the read request timeouts set to a large value
+          (to ensure queries are not aborted) and read_iteration_delay set to 5 milliseconds
           (this will cause read queries to take longer than usual)
         - CREATE and INSERT into a table
         - SELECT * from the table using a retry policy that never retries, and check that the slow
@@ -933,53 +1116,66 @@ class SlowQueryTester(CQLTester):
         """
         cluster = self.cluster
         cluster.set_configuration_options(values={'slow_query_log_timeout_in_ms': 0,
-                                                  'read_request_timeout_in_ms': 60000})
+                                                  'request_timeout_in_ms': 120000,
+                                                  'read_request_timeout_in_ms': 120000,
+                                                  'range_request_timeout_in_ms': 120000})
 
         # cassandra.test.read_iteration_delay_ms causes the state tracking read iterators
         # introduced by CASSANDRA-7392 to pause by the specified amount of milliseconds during each
         # iteration of non system queries, so that these queries take much longer to complete,
         # see ReadCommand.withStateTracking()
         cluster.populate(1).start(wait_for_binary_proto=True,
-                                  jvm_args=["-Dcassandra.monitoring_check_interval_ms=50",
-                                            "-Dcassandra.test.read_iteration_delay_ms=50"])
+                                  jvm_args=["-Dcassandra.monitoring_report_interval_ms=10",
+                                            "-Dcassandra.test.read_iteration_delay_ms=1"])
         node = cluster.nodelist()[0]
         session = self.patient_cql_connection(node)
 
-        self.create_ks(session, 'ks', 1)
+        create_ks(session, 'ks', 1)
         session.execute("""
-            CREATE TABLE test1 (
+            CREATE TABLE test3 (
                 id int PRIMARY KEY,
                 val text
             );
         """)
 
         for i in range(100):
-            session.execute("INSERT INTO test1 (id, val) VALUES ({}, 'foo')".format(i))
+            session.execute("INSERT INTO test3 (id, val) VALUES ({}, 'foo')".format(i))
 
-        session.execute(SimpleStatement("SELECT * from test1",
+        session.execute(SimpleStatement("SELECT * from test3",
                                         consistency_level=ConsistencyLevel.ONE,
                                         retry_policy=FallthroughRetryPolicy()))
 
         time.sleep(1)  # do our best to ensure logs had a chance to appear
 
-        self._check_logs(node, "operations were slow", 'system.log', 0)
-        self._check_logs(node, "SELECT \* FROM ks.test2", 'debug.log', 0)
+        self._check_logs(node, "SELECT \* FROM ks.test3", 'debug.log', 0)
 
     def _check_logs(self, node, pattern, filename, num_expected):
         ret = node.grep_log(pattern, filename=filename)
         assert_length_equal(ret, num_expected)
 
 
-@canReuseCluster
-class LWTTester(CQLTester):
+class LWTTester(ReusableClusterTester):
     """
     Validate CQL queries for LWTs for static columns for null and non-existing rows
     @jira_ticket CASSANDRA-9842
     """
 
-    @since('2.1')
+    @classmethod
+    def post_initialize_cluster(cls):
+        cluster = cls.cluster
+        cluster.populate(3)
+        cluster.start(wait_for_binary_proto=True)
+
+    def get_lwttester_session(self):
+        node1 = self.cluster.nodelist()[0]
+        session = self.patient_cql_connection(node1)
+        session.execute("""CREATE KEYSPACE IF NOT EXISTS ks WITH REPLICATION={'class':'SimpleStrategy',
+            'replication_factor':1}""")
+        session.execute("USE ks")
+        return session
+
     def lwt_with_static_columns_test(self):
-        session = self.prepare(3)
+        session = self.get_lwttester_session()
 
         session.execute("""
             CREATE TABLE lwt_with_static (a int, b int, s int static, d text, PRIMARY KEY (a, b))
@@ -1025,9 +1221,11 @@ class LWTTester(CQLTester):
 
         assert_one(session, "SELECT a, s, d FROM {} WHERE a = 4".format(table_name), [4, 4, None])
 
-    @since('2.1')
+    def _is_new_lwt_format_version(self, version):
+        return version > LooseVersion('3.9') or (version > LooseVersion('3.0.9') and version < LooseVersion('3.1'))
+
     def conditional_updates_on_static_columns_with_null_values_test(self):
-        session = self.prepare(3)
+        session = self.get_lwttester_session()
 
         table_name = "conditional_updates_on_static_columns_with_null"
         session.execute("""
@@ -1039,18 +1237,19 @@ class LWTTester(CQLTester):
 
         self._validate_non_existing_or_null_values(table_name, session)
 
-        assert_one(session, "UPDATE {} SET s = 30 WHERE a = 3 IF s IN (10,20,30)".format(table_name), [False])
+        assert_one(session, "UPDATE {} SET s = 30 WHERE a = 3 IF s IN (10,20,30)".format(table_name),
+                   [False, None] if self._is_new_lwt_format_version(self.cluster.version()) else [False])
 
         assert_one(session, "SELECT * FROM {} WHERE a = 3".format(table_name), [3, 3, None, None])
 
         for operator in [">", "<", ">=", "<=", "="]:
-            assert_one(session, "UPDATE {} SET s = 50 WHERE a = 5 IF s {} 3".format(table_name, operator), [False])
+            assert_one(session, "UPDATE {} SET s = 50 WHERE a = 5 IF s {} 3".format(table_name, operator),
+                       [False, None] if self._is_new_lwt_format_version(self.cluster.version()) else [False])
 
             assert_one(session, "SELECT * FROM {} WHERE a = 5".format(table_name), [5, 5, None, None])
 
-    @since('2.1')
     def conditional_updates_on_static_columns_with_non_existing_values_test(self):
-        session = self.prepare(3)
+        session = self.get_lwttester_session()
 
         table_name = "conditional_updates_on_static_columns_with_ne"
         session.execute("""
@@ -1101,9 +1300,8 @@ class LWTTester(CQLTester):
 
         assert_one(session, "SELECT * FROM {table_name} WHERE a = 7".format(table_name=table_name), [7, 7, 8, "a"])
 
-    @since('2.1')
     def conditional_updates_on_static_columns_with_null_values_batch_test(self):
-        session = self.prepare(3)
+        session = self.get_lwttester_session()
 
         table_name = "lwt_on_static_columns_with_null_batch"
         session.execute("""
@@ -1120,7 +1318,8 @@ class LWTTester(CQLTester):
                 BEGIN BATCH
                     INSERT INTO {table_name} (a, b, s, d) values (3, 3, 40, 'a')
                     UPDATE {table_name} SET s = 30 WHERE a = 3 IF s {operator} 5;
-                APPLY BATCH""".format(table_name=table_name, operator=operator), [False])
+                APPLY BATCH""".format(table_name=table_name, operator=operator),
+                       [False, 3, 3, None] if self._is_new_lwt_format_version(self.cluster.version()) else [False])
 
             assert_one(session, "SELECT * FROM {table_name} WHERE a = 3".format(table_name=table_name), [3, 3, None, None])
 
@@ -1128,15 +1327,13 @@ class LWTTester(CQLTester):
                 BEGIN BATCH
                     INSERT INTO {table_name} (a, b, s, d) values (6, 6, 70, 'a')
                     UPDATE {table_name} SET s = 60 WHERE a = 6 IF s IN (1,2,3)
-                APPLY BATCH""".format(table_name=table_name), [False])
+                APPLY BATCH""".format(table_name=table_name),
+                   [False, 6, 6, None] if self._is_new_lwt_format_version(self.cluster.version()) else [False])
 
         assert_one(session, "SELECT * FROM {table_name} WHERE a = 6".format(table_name=table_name), [6, 6, None, None])
 
-    def _conditional_deletes_on_static_columns_with_null_values_test(self, is_2_x):
-        """
-        2.x and 3.x are returning failed LWTs in slightly different format.
-        """
-        session = self.prepare(3)
+    def conditional_deletes_on_static_columns_with_null_values_test(self):
+        session = self.get_lwttester_session()
 
         table_name = "conditional_deletes_on_static_with_null"
         session.execute("""
@@ -1150,10 +1347,7 @@ class LWTTester(CQLTester):
 
         assert_one(session, "SELECT * FROM {} WHERE a = 1".format(table_name), [1, 1, None, None, 1])
 
-        if is_2_x:
-            assert_one(session, "DELETE s1 FROM {} WHERE a = 2 IF s2 IN (10,20,30)".format(table_name), [False, None])
-        else:
-            assert_one(session, "DELETE s1 FROM {} WHERE a = 2 IF s2 IN (10,20,30)".format(table_name), [False])
+        assert_one(session, "DELETE s1 FROM {} WHERE a = 2 IF s2 IN (10,20,30)".format(table_name), [False, None])
 
         assert_one(session, "SELECT * FROM {} WHERE a = 2".format(table_name), [2, 2, 2, None, 2])
 
@@ -1166,24 +1360,11 @@ class LWTTester(CQLTester):
         assert_one(session, "SELECT * FROM {} WHERE a = 4".format(table_name), [4, 4, None, None, 4])
 
         for operator in [">", "<", ">=", "<=", "="]:
-            if is_2_x:
-                assert_one(session, "DELETE s1 FROM {} WHERE a = 5 IF s2 {} 3".format(table_name, operator), [False, None])
-            else:
-                assert_one(session, "DELETE s1 FROM {} WHERE a = 5 IF s2 {} 3".format(table_name, operator), [False])
-
+            assert_one(session, "DELETE s1 FROM {} WHERE a = 5 IF s2 {} 3".format(table_name, operator), [False, None])
             assert_one(session, "SELECT * FROM {} WHERE a = 5".format(table_name), [5, 5, 5, None, 5])
 
-    @since('2.1', max_version='3.0')
-    def conditional_deletes_on_static_columns_with_null_values_test(self):
-        self._conditional_deletes_on_static_columns_with_null_values_test(True)
-
-    @since('3.0')
-    def conditional_deletes_on_static_columns_with_null_values_test(self):
-        self._conditional_deletes_on_static_columns_with_null_values_test(False)
-
-    @since('2.1')
     def conditional_deletes_on_static_columns_with_null_values_batch_test(self):
-        session = self.prepare(3)
+        session = self.get_lwttester_session()
 
         table_name = "conditional_deletes_on_static_with_null_batch"
         session.execute("""
@@ -1238,3 +1419,18 @@ class LWTTester(CQLTester):
             APPLY BATCH""".format(table_name=table_name), [True])
 
         assert_one(session, "SELECT * FROM {} WHERE a = 7".format(table_name), [7, 7, None, None, 7])
+
+    def lwt_with_empty_resultset(self):
+        """
+        LWT with unset row.
+        @jira_ticket CASSANDRA-12694
+        """
+        session = self.get_lwttester_session()
+
+        session.execute("""
+            CREATE TABLE test (pk text, v1 int, v2 text, PRIMARY KEY (pk));
+        """)
+        session.execute("update test set v1 = 100 where pk = 'test1';")
+        node1 = self.cluster.nodelist()[0]
+        self.cluster.flush()
+        assert_one(session, "UPDATE test SET v1 = 100 WHERE pk = 'test1' IF v2 = null;", [True])

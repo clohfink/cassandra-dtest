@@ -15,11 +15,12 @@ from cassandra.concurrent import (execute_concurrent,
 from ccmlib.node import Node
 from nose.tools import assert_equal, assert_less_equal
 
-from dtest import Tester, debug
+from dtest import Tester, create_ks, debug
 from tools.data import rows_to_list
-from tools.decorators import known_failure, since
+from tools.decorators import since
 from tools.files import size_of_files_in_dir
 from tools.funcutils import get_rate_limited_function
+from tools.hacks import advance_to_next_cl_segment
 
 _16_uuid_column_spec = (
     'a uuid PRIMARY KEY, b uuid, c uuid, d uuid, e uuid, f uuid, g uuid, '
@@ -255,7 +256,7 @@ class TestCDC(Tester):
         self.cluster.start(wait_for_binary_proto=True)
         node = self.cluster.nodelist()[0]
         session = self.patient_cql_connection(node)
-        self.create_ks(session, ks_name, rf=1)
+        create_ks(session, ks_name, rf=1)
 
         if table_name is not None:
             self.assertIsNotNone(cdc_enabled_table, 'if creating a table in prepare, must specify whether or not CDC is enabled on it')
@@ -444,12 +445,12 @@ class TestCDC(Tester):
         session.cluster.shutdown()
         self.assertEqual(pre_non_cdc_write_cdc_raw_segments, _get_cdc_raw_files(node.get_path()))
 
-    def _init_new_loading_node(self, ks_name, create_stmt):
+    def _init_new_loading_node(self, ks_name, create_stmt, use_thrift=False):
         loading_node = Node(
             name='node2',
             cluster=self.cluster,
             auto_bootstrap=False,
-            thrift_interface=('127.0.0.2', 9160),
+            thrift_interface=('127.0.0.2', 9160) if use_thrift else None,
             storage_interface=('127.0.0.2', 7000),
             jmx_port='7400',
             remote_debug_port='0',
@@ -462,7 +463,7 @@ class TestCDC(Tester):
         loading_node.start(wait_for_binary_proto=True)
         debug('recreating ks and table')
         loading_session = self.patient_exclusive_cql_connection(loading_node)
-        self.create_ks(loading_session, ks_name, rf=1)
+        create_ks(loading_session, ks_name, rf=1)
         debug('creating new table')
         loading_session.execute(create_stmt)
         debug('stopping new node')
@@ -470,9 +471,6 @@ class TestCDC(Tester):
         loading_session.cluster.shutdown()
         return loading_node
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11811',
-                   flaky=False)
     def test_cdc_data_available_in_cdc_raw(self):
         ks_name = 'ks'
         # First, create a new node just for data generation.
@@ -489,6 +487,15 @@ class TestCDC(Tester):
                 'id': uuid.uuid4()
             }
         )
+
+        # Write until we get a new CL segment to avoid replaying initialization
+        # mutations from this node's startup into system tables in the other
+        # node. See CASSANDRA-11811.
+        advance_to_next_cl_segment(
+            session=generation_session,
+            commitlog_dir=os.path.join(generation_node.get_path(), 'commitlogs')
+        )
+
         generation_session.execute(cdc_table_info.create_stmt)
 
         # insert 10000 rows
@@ -503,7 +510,7 @@ class TestCDC(Tester):
         generation_session.cluster.shutdown()
 
         # create a new node to use for cdc_raw cl segment replay
-        loading_node = self._init_new_loading_node(ks_name, cdc_table_info.create_stmt)
+        loading_node = self._init_new_loading_node(ks_name, cdc_table_info.create_stmt, self.cluster.version() < '4')
 
         # move cdc_raw contents to commitlog directories, then start the
         # node again to trigger commitlog replay, which should replay the

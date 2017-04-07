@@ -1,18 +1,14 @@
 import os
 import tempfile
 
-from dtest import Tester, debug
+from dtest import Tester, debug, create_ks
 from tools.data import rows_to_list
-from tools.decorators import known_failure, since
+from tools.decorators import since
 
 
 @since('0', '2.2.X')
 class TestJson(Tester):
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11952',
-                   flaky=False
-                   )
     def json_tools_test(self):
 
         debug("Starting cluster...")
@@ -20,14 +16,14 @@ class TestJson(Tester):
         cluster.set_batch_commitlog(enabled=True)
         cluster.populate(1).start()
 
-        debug("Version: " + cluster.version())
+        debug("Version: " + cluster.version().vstring)
 
         debug("Getting CQLSH...")
         [node1] = cluster.nodelist()
         session = self.patient_cql_connection(node1)
 
         debug("Inserting data...")
-        self.create_ks(session, 'Test', 1)
+        create_ks(session, 'Test', 1)
 
         session.execute("""
             CREATE TABLE users (
@@ -69,7 +65,7 @@ class TestJson(Tester):
 
         debug("Inserting data...")
         session = self.patient_cql_connection(node1)
-        self.create_ks(session, 'Test', 1)
+        create_ks(session, 'Test', 1)
 
         session.execute("""
             CREATE TABLE users (

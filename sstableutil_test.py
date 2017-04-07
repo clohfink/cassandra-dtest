@@ -25,10 +25,6 @@ def _normcase_all(xs):
 @since('3.0')
 class SSTableUtilTest(Tester):
 
-    def __init__(self, *args, **kwargs):
-        kwargs['cluster_options'] = {'start_rpc': 'true'}
-        Tester.__init__(self, *args, **kwargs)
-
     def compaction_test(self):
         """
         @jira_ticket CASSANDRA-7066

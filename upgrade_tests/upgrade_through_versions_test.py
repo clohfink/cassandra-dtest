@@ -17,7 +17,6 @@ from nose.plugins.attrib import attr
 from six import print_
 
 from dtest import RUN_STATIC_UPGRADE_MATRIX, Tester, debug
-from tools.decorators import known_failure
 from tools.misc import generate_ssl_stores, new_node
 from upgrade_base import switch_jdks
 from upgrade_manifest import (build_upgrade_pairs, current_2_0_x,
@@ -231,20 +230,19 @@ class UpgradeTester(Tester):
     subprocs = None  # holds any subprocesses, for status checking and cleanup
     extra_config = None  # holds a non-mutable structure that can be cast as dict()
     __test__ = False  # this is a base class only
+    ignore_log_patterns = (
+        # This one occurs if we do a non-rolling upgrade, the node
+        # it's trying to send the migration to hasn't started yet,
+        # and when it does, it gets replayed and everything is fine.
+        r'Can\'t send migration request: node.*is down',
+        r'RejectedExecutionException.*ThreadPoolExecutor has shut down',
+        # Occurs due to test/ccm writing topo on down nodes
+        r'Cannot update data center or rack from.*for live host',
+        # Normal occurance. See CASSANDRA-12026. Likely won't be needed after C* 4.0.
+        r'Unknown column cdc during deserialization',
+    )
 
     def __init__(self, *args, **kwargs):
-        # Ignore these log patterns:
-        self.ignore_log_patterns = [
-            # This one occurs if we do a non-rolling upgrade, the node
-            # it's trying to send the migration to hasn't started yet,
-            # and when it does, it gets replayed and everything is fine.
-            r'Can\'t send migration request: node.*is down',
-            r'RejectedExecutionException.*ThreadPoolExecutor has shut down',
-            # Occurs due to test/ccm writing topo on down nodes
-            r'Cannot update data center or rack from.*for live host',
-            # Normal occurance. See CASSANDRA-12026. Likely won't be needed after C* 4.0.
-            r'Unknown column cdc during deserialization',
-        ]
         self.subprocs = []
         Tester.__init__(self, *args, **kwargs)
 
@@ -274,12 +272,6 @@ class UpgradeTester(Tester):
         """
         self.upgrade_scenario()
 
-    @known_failure(failure_source='cassandra',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-12457',
-                   flaky=True)
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-12444',
-                   flaky=True)
     def rolling_upgrade_test(self):
         """
         Test rolling upgrade of the cluster, so we have mixed versions part way through.

@@ -1,7 +1,8 @@
 # coding: utf-8
+from distutils.version import LooseVersion
 
-from dtest import Tester, debug
-from tools.decorators import since, known_failure
+from dtest import Tester, debug, create_ks
+from tools.decorators import since
 
 
 class TestCqlTracing(Tester):
@@ -27,7 +28,7 @@ class TestCqlTracing(Tester):
 
         session = self.patient_cql_connection(node1, protocol_version=protocol_version)
         if create_keyspace:
-            self.create_ks(session, 'ks', rf)
+            create_ks(session, 'ks', rf)
         return session
 
     def trace(self, session):
@@ -123,13 +124,14 @@ class TestCqlTracing(Tester):
         errs = self.cluster.nodelist()[0].grep_log_for_errors()
         debug('Errors after attempted trace with unknown tracing class: {errs}'.format(errs=errs))
         self.assertEqual(len(errs), 1)
-        self.assertTrue(len(errs[0]) > 0)
+        if self.cluster.version() >= LooseVersion('3.10'):
+            # See CASSANDRA-11706 and PR #1281
+            self.assertTrue(len(errs[0]) > 0)
+        else:
+            self.assertEqual(len(errs[0]), 1)
         err = errs[0][0]
         self.assertIn(expected_error, err)
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-12579',
-                   flaky=True)
     @since('3.4')
     def tracing_default_impl_test(self):
         """
@@ -155,12 +157,22 @@ class TestCqlTracing(Tester):
         errs = self.cluster.nodelist()[0].grep_log_for_errors()
         debug('Errors after attempted trace with default tracing class: {errs}'.format(errs=errs))
         self.assertEqual(len(errs), 1)
-        self.assertTrue(len(errs[0]) > 0)
+        if self.cluster.version() >= LooseVersion('3.10'):
+            # See CASSANDRA-11706 and PR #1281
+            self.assertTrue(len(errs[0]) > 0)
+        else:
+            self.assertEqual(len(errs[0]), 1)
         err = errs[0][0]
         self.assertIn(expected_error, err)
         # make sure it logged the error for the correct reason. this isn't
         # part of the expected error to avoid having to escape parens and
         # periods for regexes.
+
+        if self.cluster.version() >= LooseVersion('3.10'):
+            # See CASSANDRA-11706 and PR #1281
+            check_for_errs_in = errs[0][1]
+        else:
+            check_for_errs_in = err
         self.assertIn("Default constructor for Tracing class "
                       "'org.apache.cassandra.tracing.TracingImpl' is inaccessible.",
-                      errs[0][1])
+                      check_for_errs_in)

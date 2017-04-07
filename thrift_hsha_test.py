@@ -6,9 +6,13 @@ import time
 import unittest
 
 import pycassa
-from dtest import DEFAULT_DIR, Tester, debug
+
+from dtest import DEFAULT_DIR, Tester, debug, create_ks
 from tools.jmxutils import (JolokiaAgent, make_mbean,
                             remove_perf_disable_shared_mem)
+
+from tools.decorators import since
+
 
 JNA_PATH = '/usr/share/java/jna.jar'
 ATTACK_JAR = 'lib/cassandra-attack.jar'
@@ -26,10 +30,8 @@ except KeyError:
         JNA_PATH = JNA_IN_LIB[0]
 
 
+@since('2.0', max_version='4')
 class ThriftHSHATest(Tester):
-
-    def __init__(self, *args, **kwargs):
-        Tester.__init__(self, *args, **kwargs)
 
     def test_closing_connections(self):
         """
@@ -50,7 +52,7 @@ class ThriftHSHATest(Tester):
         cluster.start(wait_for_binary_proto=True)
 
         session = self.patient_cql_connection(node1)
-        self.create_ks(session, 'test', 1)
+        create_ks(session, 'test', 1)
         session.execute("CREATE TABLE \"CF\" (key text PRIMARY KEY, val text) WITH COMPACT STORAGE;")
 
         def make_connection():
@@ -105,7 +107,7 @@ class ThriftHSHATest(Tester):
         debug("Cluster started.")
 
         session = self.patient_cql_connection(node1)
-        self.create_ks(session, 'tmp', 2)
+        create_ks(session, 'tmp', 2)
 
         session.execute("""CREATE TABLE "CF" (
   key blob,

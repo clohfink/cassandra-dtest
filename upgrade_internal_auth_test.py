@@ -3,48 +3,94 @@ from unittest import skipIf
 
 from cassandra import Unauthorized
 from ccmlib.common import is_win
+from ccmlib.node import Node
 
 from dtest import OFFHEAP_MEMTABLES, Tester, debug
 from tools.assertions import assert_all, assert_invalid
-from tools.decorators import known_failure, since
+from tools.decorators import since
+from tools.misc import ImmutableMapping
 
 
 @since('2.2')
 class TestAuthUpgrade(Tester):
+    cluster_options = ImmutableMapping({'authenticator': 'PasswordAuthenticator',
+                                        'authorizer': 'CassandraAuthorizer'})
+    ignore_log_patterns = (
+        # This one occurs if we do a non-rolling upgrade, the node
+        # it's trying to send the migration to hasn't started yet,
+        # and when it does, it gets replayed and everything is fine.
+        r'Can\'t send migration request: node.*is down',
+    )
 
-    def __init__(self, *args, **kwargs):
-        # Ignore these log patterns:
-        self.ignore_log_patterns = [
-            # This one occurs if we do a non-rolling upgrade, the node
-            # it's trying to send the migration to hasn't started yet,
-            # and when it does, it gets replayed and everything is fine.
-            r'Can\'t send migration request: node.*is down',
-        ]
-
-        # Force cluster options that are common among versions:
-        kwargs['cluster_options'] = {'authenticator': 'PasswordAuthenticator',
-                                     'authorizer': 'CassandraAuthorizer'}
-        Tester.__init__(self, *args, **kwargs)
-
-    @known_failure(failure_source='cassandra',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11469',
-                   flaky=True,
-                   notes='Fails ~30% of the time.')
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11250',
-                   flaky=True,
-                   notes='windows')
     def upgrade_to_22_test(self):
         self.do_upgrade_with_internal_auth("git:cassandra-2.2")
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11267',
-                   flaky=True,
-                   notes='windows')
     @since('3.0')
     @skipIf(OFFHEAP_MEMTABLES, 'offheap_objects are not available in 3.0')
     def upgrade_to_30_test(self):
         self.do_upgrade_with_internal_auth("git:cassandra-3.0")
+
+    @since('2.2', max_version='3.X')
+    def test_upgrade_legacy_table(self):
+        """
+        Upgrade with bringing up the legacy tables after the newer nodes (without legacy tables)
+        were started.
+
+        @jira_ticket CASSANDRA-12813
+        """
+
+        cluster = self.cluster
+
+        # Forcing cluster version on purpose
+        cluster.set_install_dir(version="2.1.16")
+        cluster.populate(3).start()
+
+        node1, node2, node3 = cluster.nodelist()
+
+        # Wait for default user to get created on one of the nodes
+        time.sleep(15)
+
+        # Upgrade to current version
+        for node in [node1, node2, node3]:
+            node.drain()
+            node.watch_log_for("DRAINED")
+            node.stop(gently=True)
+            self.set_node_to_current_version(node)
+
+        cluster.start()
+
+        # Make sure the system_auth table will get replicated to the node that we're going to replace
+        session = self.patient_cql_connection(node1, user='cassandra', password='cassandra')
+        session.execute("ALTER KEYSPACE system_auth WITH REPLICATION = { 'class' : 'SimpleStrategy', 'replication_factor' : 3 };")
+        cluster.repair()
+
+        cluster.stop()
+
+        # Replace the node
+        cluster.seeds.remove(node1)
+        cluster.remove(node1)
+
+        replacement_address = node1.address()
+        replacement_node = Node('replacement', cluster=self.cluster, auto_bootstrap=True,
+                                thrift_interface=(replacement_address, 9160), storage_interface=(replacement_address, 7000),
+                                jmx_port='7400', remote_debug_port='0', initial_token=None, binary_interface=(replacement_address, 9042))
+        self.set_node_to_current_version(replacement_node)
+
+        cluster.add(replacement_node, True)
+        replacement_node.start(wait_for_binary_proto=True)
+
+        node2.start(wait_for_binary_proto=True)
+        node3.start(wait_for_binary_proto=True)
+
+        replacement_node.watch_log_for('Initializing system_auth.credentials')
+        replacement_node.watch_log_for('Initializing system_auth.permissions')
+        replacement_node.watch_log_for('Initializing system_auth.users')
+
+        cluster.repair()
+        replacement_node.watch_log_for('Repair command')
+
+        # Should succeed. Will throw an NPE on pre-12813 code.
+        self.patient_cql_connection(replacement_node, user='cassandra', password='cassandra')
 
     def do_upgrade_with_internal_auth(self, target_version):
         """
@@ -99,9 +145,9 @@ class TestAuthUpgrade(Tester):
 
         # we should now be able to drop the old auth tables
         session = self.patient_cql_connection(node1, user='cassandra', password='cassandra')
-        session.execute('DROP TABLE system_auth.users')
-        session.execute('DROP TABLE system_auth.credentials')
-        session.execute('DROP TABLE system_auth.permissions')
+        session.execute('DROP TABLE system_auth.users', timeout=60)
+        session.execute('DROP TABLE system_auth.credentials', timeout=60)
+        session.execute('DROP TABLE system_auth.permissions', timeout=60)
         # and we should still be able to authenticate and check authorization
         self.check_permissions(node1, True)
         debug('Test completed successfully')
@@ -117,12 +163,14 @@ class TestAuthUpgrade(Tester):
             assert_all(klaus,
                        'LIST ALL PERMISSIONS',
                        [['michael', '<table ks.cf1>', 'MODIFY'],
-                        ['michael', '<table ks.cf2>', 'SELECT']])
+                        ['michael', '<table ks.cf2>', 'SELECT']],
+                       timeout=60)
         else:
             assert_all(klaus,
                        'LIST ALL PERMISSIONS',
                        [['michael', 'michael', '<table ks.cf1>', 'MODIFY'],
-                        ['michael', 'michael', '<table ks.cf2>', 'SELECT']])
+                        ['michael', 'michael', '<table ks.cf2>', 'SELECT']],
+                       timeout=60)
 
         klaus.cluster.shutdown()
 

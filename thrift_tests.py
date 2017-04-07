@@ -2,14 +2,14 @@ import re
 import struct
 import time
 import uuid
+from unittest import skipIf
 
 from thrift.protocol import TBinaryProtocol
 from thrift.Thrift import TApplicationException
 from thrift.transport import TSocket, TTransport
 
-from tools.assertions import assert_none, assert_one
-from dtest import (DISABLE_VNODES, NUM_TOKENS, ReusableClusterTester, debug,
-                   init_default_config)
+from dtest import (CASSANDRA_VERSION_FROM_BUILD, DISABLE_VNODES, NUM_TOKENS,
+                   ReusableClusterTester, debug, init_default_config)
 from thrift_bindings.v22 import Cassandra
 from thrift_bindings.v22.Cassandra import (CfDef, Column, ColumnDef,
                                            ColumnOrSuperColumn, ColumnParent,
@@ -22,7 +22,8 @@ from thrift_bindings.v22.Cassandra import (CfDef, Column, ColumnDef,
                                            Mutation, NotFoundException,
                                            SlicePredicate, SliceRange,
                                            SuperColumn)
-from tools.decorators import known_failure, since
+from tools.assertions import assert_none, assert_one
+from tools.decorators import since
 
 
 def get_thrift_client(host='127.0.0.1', port=9160):
@@ -32,6 +33,8 @@ def get_thrift_client(host='127.0.0.1', port=9160):
     client = Cassandra.Client(protocol)
     client.transport = transport
     return client
+
+
 client = None
 
 pid_fname = "system_test.pid"
@@ -41,6 +44,7 @@ def pid():
     return int(open(pid_fname).read())
 
 
+@since('2.0', max_version='4')
 class ThriftTester(ReusableClusterTester):
     client = None
     extra_args = []
@@ -53,6 +57,11 @@ class ThriftTester(ReusableClusterTester):
         super(ThriftTester, cls).setUpClass()
 
     def setUp(self):
+        # This is called before the @since annotation has had time to take
+        # effect and we don't want to even try connecting on thrift in 4.0
+        if self.cluster.version() >= '4':
+            return
+
         ReusableClusterTester.setUp(self)
 
         # this is ugly, but the whole test module is written against a global client
@@ -61,12 +70,23 @@ class ThriftTester(ReusableClusterTester):
         client.transport.open()
 
     def tearDown(self):
+        # This is called before the @since annotation has had time to take
+        # effect and we don't want to even try connecting on thrift in 4.0
+        if self.cluster.version() >= '4':
+            return
+
         client.transport.close()
         ReusableClusterTester.tearDown(self)
 
     @classmethod
     def post_initialize_cluster(cls):
         cluster = cls.cluster
+
+        # This is called before the @since annotation has had time to take
+        # effect and we don't want to even try connecting on thrift in 4.0
+        if cluster.version() >= '4':
+            return
+
         cluster.populate(1)
         node1, = cluster.nodelist()
 
@@ -122,6 +142,26 @@ class ThriftTester(ReusableClusterTester):
             cls.client.system_add_keyspace(ks)
 
 
+def i64(n):
+    return _i64(n)
+
+
+def i32(n):
+    return _i32(n)
+
+
+def i16(n):
+    return _i16(n)
+
+
+def composite(item1, item2=None, eoc='\x00'):
+    packed = _i16(len(item1)) + item1 + eoc
+    if item2 is not None:
+        packed += _i16(len(item2)) + item2
+        packed += eoc
+    return packed
+
+
 def _i64(n):
     return struct.pack('>q', n)  # big endian = network order
 
@@ -132,6 +172,7 @@ def _i32(n):
 
 def _i16(n):
     return struct.pack('>h', n)  # big endian = network order
+
 
 _SIMPLE_COLUMNS = [Column('c1', 'value1', 0),
                    Column('c2', 'value2', 0)]
@@ -314,9 +355,11 @@ def _big_multi_slice(key='abc'):
     m.consistency_level = ConsistencyLevel.ONE
     return client.get_multi_slice(m)
 
+
 _MULTI_SLICE_COLUMNS = [Column('a', '1', 0), Column('b', '2', 0), Column('c', '3', 0), Column('e', '5', 0), Column('f', '6', 0)]
 
 
+@since('2.0', max_version='4')
 class TestMutations(ThriftTester):
 
     def truncate_all(self, *table_names):
@@ -1269,10 +1312,6 @@ class TestMutations(ThriftTester):
         _insert_super_range()
         _verify_super_range()
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-12000',
-                   flaky=True,
-                   notes='Fails on windows')
     def test_get_range_slices_tokens(self):
         _set_keyspace('Keyspace2')
         self.truncate_all('Super3')
@@ -2161,13 +2200,6 @@ class TestMutations(ThriftTester):
         _set_keyspace('Keyspace1')
         self.truncate_all('StandardComposite')
 
-        def composite(item1, item2=None, eoc='\x00'):
-            packed = _i16(len(item1)) + item1 + eoc
-            if item2 is not None:
-                packed += _i16(len(item2)) + item2
-                packed += eoc
-            return packed
-
         for i in range(10):
             column_name = composite(str(i), str(i))
             column = Column(column_name, 'value', int(time.time() * 1000))
@@ -2185,6 +2217,68 @@ class TestMutations(ThriftTester):
             columns,
             [composite('0', '0'), composite('1', '1'), composite('2', '2'),
              composite('6', '6'), composite('7', '7'), composite('8', '8'), composite('9', '9')])
+
+    @skipIf(CASSANDRA_VERSION_FROM_BUILD == '3.9', "Test doesn't run on 3.9")
+    def test_range_deletion_eoc_0(self):
+        """
+        This test confirms that a range tombstone with a final EOC of 0
+        results in a exclusive deletion except for cells that exactly match the tombstone bound.
+
+        @jira_ticket CASSANDRA-12423
+
+        """
+        _set_keyspace('Keyspace1')
+        self.truncate_all('StandardComposite')
+
+        for i in range(10):
+            column_name = composite(str(i), str(i))
+            column = Column(column_name, 'value', int(time.time() * 1000))
+            client.insert('key1', ColumnParent('StandardComposite'), column, ConsistencyLevel.ONE)
+
+        # insert a partial cell name (just the first element of the composite)
+        column_name = composite('6', None, eoc='\x00')
+        column = Column(column_name, 'value', int(time.time() * 1000))
+        client.insert('key1', ColumnParent('StandardComposite'), column, ConsistencyLevel.ONE)
+
+        # sanity check the query
+        slice_predicate = SlicePredicate(slice_range=SliceRange('', '', False, 100))
+        results = client.get_slice('key1', ColumnParent('StandardComposite'), slice_predicate, ConsistencyLevel.ONE)
+        columns = [result.column.name for result in results]
+        self.assertEqual(
+            columns,
+            [composite('0', '0'), composite('1', '1'), composite('2', '2'), composite('3', '3'), composite('4', '4'), composite('5', '5'),
+             composite('6'),
+             composite('6', '6'),
+             composite('7', '7'), composite('8', '8'), composite('9', '9')])
+
+        # do a slice deletion with (6, ) as the end
+        delete_slice = SlicePredicate(slice_range=SliceRange(composite('3', eoc='\xff'), composite('6', '\x00'), False, 100))
+        mutations = [Mutation(deletion=Deletion(int(time.time() * 1000), predicate=delete_slice))]
+        keyed_mutations = {'key1': {'StandardComposite': mutations}}
+        client.batch_mutate(keyed_mutations, ConsistencyLevel.ONE)
+
+        # check the columns post-deletion, ('6', ) because it is an exact much but not (6, 6)
+        results = client.get_slice('key1', ColumnParent('StandardComposite'), slice_predicate, ConsistencyLevel.ONE)
+        columns = [result.column.name for result in results]
+        self.assertEqual(
+            columns,
+            [composite('0', '0'), composite('1', '1'), composite('2', '2'),
+             composite('6', '6'),
+             composite('7', '7'), composite('8', '8'), composite('9', '9')])
+
+        # do another slice deletion, but make the end (6, 6) this time
+        delete_slice = SlicePredicate(slice_range=SliceRange(composite('3', eoc='\xff'), composite('6', '6', '\x00'), False, 100))
+        mutations = [Mutation(deletion=Deletion(int(time.time() * 1000), predicate=delete_slice))]
+        keyed_mutations = {'key1': {'StandardComposite': mutations}}
+        client.batch_mutate(keyed_mutations, ConsistencyLevel.ONE)
+
+        # check the columns post-deletion, now (6, 6) is also gone
+        results = client.get_slice('key1', ColumnParent('StandardComposite'), slice_predicate, ConsistencyLevel.ONE)
+        columns = [result.column.name for result in results]
+        self.assertEqual(
+            columns,
+            [composite('0', '0'), composite('1', '1'), composite('2', '2'),
+             composite('7', '7'), composite('8', '8'), composite('9', '9')])
 
     def test_incr_decr_standard_slice(self):
         _set_keyspace('Keyspace1')
@@ -2480,3 +2574,38 @@ class TestMutations(ThriftTester):
         i = 1
         client.insert(_i32(i), ColumnParent('cs1'), Column('v', _i32(i), 0), CL)
         _assert_column('cs1', _i32(i), 'v', _i32(i), 0)
+
+    @skipIf(CASSANDRA_VERSION_FROM_BUILD == '3.9', "Test doesn't run on 3.9")
+    def test_range_tombstone_eoc_0(self):
+        """
+        Insert a range tombstone with EOC=0 for a compact storage table. Insert 2 rows that
+        are just outside the range and check that they are present.
+
+        @jira_ticket CASSANDRA-12423
+        """
+        node1 = self.cluster.nodelist()[0]
+        session = self.patient_cql_connection(node1)
+
+        session.execute('USE "Keyspace1"')
+        session.execute("CREATE TABLE test (id INT, c1 TEXT, c2 TEXT, v INT, PRIMARY KEY (id, c1, c2)) "
+                        "with compact storage and compression = {'sstable_compression': ''};")
+
+        _set_keyspace('Keyspace1')
+
+        range_delete = {
+            _i32(1): {
+                'test': [Mutation(deletion=Deletion(2470761440040513,
+                                                    predicate=SlicePredicate(slice_range=SliceRange(
+                                                        start=composite('a'), finish=composite('asd')))))]
+            }
+        }
+
+        client.batch_mutate(range_delete, ConsistencyLevel.ONE)
+
+        session.execute("INSERT INTO test (id, c1, c2, v) VALUES (1, 'asd', '', 0) USING TIMESTAMP 1470761451368658")
+        session.execute("INSERT INTO test (id, c1, c2, v) VALUES (1, 'asd', 'asd', 0) USING TIMESTAMP 1470761449416613")
+
+        ret = list(session.execute('SELECT * FROM test'))
+        self.assertEquals(2, len(ret))
+
+        node1.nodetool('flush Keyspace1 test')

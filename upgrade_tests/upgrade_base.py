@@ -2,12 +2,12 @@ import os
 import sys
 import time
 from abc import ABCMeta
-from distutils.version import LooseVersion
 from unittest import skipIf
 
 from ccmlib.common import get_version_from_build, is_win
+from tools.jmxutils import remove_perf_disable_shared_mem
 
-from dtest import CASSANDRA_VERSION_FROM_BUILD, DEBUG, Tester, debug
+from dtest import CASSANDRA_VERSION_FROM_BUILD, DEBUG, Tester, debug, create_ks
 
 
 def switch_jdks(major_version_int):
@@ -44,7 +44,7 @@ class UpgradeTester(Tester):
 
     # known non-critical bug during teardown:
     # https://issues.apache.org/jira/browse/CASSANDRA-12340
-    if LooseVersion(CASSANDRA_VERSION_FROM_BUILD) < '2.2':
+    if CASSANDRA_VERSION_FROM_BUILD < '2.2':
         _known_teardown_race_error = (
             'ScheduledThreadPoolExecutor$ScheduledFutureTask@[0-9a-f]+ '
             'rejected from org.apache.cassandra.concurrent.DebuggableScheduledThreadPoolExecutor'
@@ -59,9 +59,9 @@ class UpgradeTester(Tester):
             self.ignore_log_patterns = []
 
         self.ignore_log_patterns = self.ignore_log_patterns[:] + [
-            # Normal occurance. See CASSANDRA-12026. Likely won't be needed after C* 4.0.
-            r'Unknown column cdc during deserialization',
+            r'RejectedExecutionException.*ThreadPoolExecutor has shut down',  # see  CASSANDRA-12364
         ]
+        self.enable_for_jolokia = False
         super(UpgradeTester, self).__init__(*args, **kwargs)
 
     def setUp(self):
@@ -101,21 +101,25 @@ class UpgradeTester(Tester):
         cluster.populate(nodes)
         node1 = cluster.nodelist()[0]
         cluster.set_install_dir(version=self.UPGRADE_PATH.starting_version)
+        self.enable_for_jolokia = kwargs.pop('jolokia', False)
+        if self.enable_for_jolokia:
+            remove_perf_disable_shared_mem(node1)
+
         cluster.start(wait_for_binary_proto=True)
 
         node1 = cluster.nodelist()[0]
         time.sleep(0.2)
 
-        session = self.patient_cql_connection(node1, protocol_version=protocol_version)
-        if create_keyspace:
-            self.create_ks(session, 'ks', rf)
-
         if cl:
-            session.default_consistency_level = cl
+            session = self.patient_cql_connection(node1, protocol_version=protocol_version, consistency_level=cl, **kwargs)
+        else:
+            session = self.patient_cql_connection(node1, protocol_version=protocol_version, **kwargs)
+        if create_keyspace:
+            create_ks(session, 'ks', rf)
 
         return session
 
-    def do_upgrade(self, session, return_nodes=False):
+    def do_upgrade(self, session, return_nodes=False, **kwargs):
         """
         Upgrades the first node in the cluster and returns a list of
         (is_upgraded, Session) tuples.  If `is_upgraded` is true, the
@@ -147,15 +151,29 @@ class UpgradeTester(Tester):
 
         # this is a bandaid; after refactoring, upgrades should account for protocol version
         new_version_from_build = get_version_from_build(node1.get_install_dir())
+
+        # Check if a since annotation with a max_version was set on this test.
+        # The since decorator can only check the starting version of the upgrade,
+        # so here we check to new version of the upgrade as well.
+        if hasattr(self, 'max_version') and self.max_version is not None and new_version_from_build >= self.max_version:
+            self.skip("Skipping test, new version {} is equal to or higher than max version {}".format(new_version_from_build, self.max_version))
+
         if (new_version_from_build >= '3' and self.protocol_version is not None and self.protocol_version < 3):
             self.skip('Protocol version {} incompatible '
                       'with Cassandra version {}'.format(self.protocol_version, new_version_from_build))
         node1.set_log_level("DEBUG" if DEBUG else "INFO")
         node1.set_configuration_options(values={'internode_compression': 'none'})
+
+        if self.enable_for_jolokia:
+            remove_perf_disable_shared_mem(node1)
+
         node1.start(wait_for_binary_proto=True, wait_other_notice=True)
 
         sessions_and_meta = []
-        session = self.patient_exclusive_cql_connection(node1, protocol_version=self.protocol_version)
+        if self.CL:
+            session = self.patient_exclusive_cql_connection(node1, protocol_version=self.protocol_version, consistency_level=self.CL, **kwargs)
+        else:
+            session = self.patient_exclusive_cql_connection(node1, protocol_version=self.protocol_version, **kwargs)
         session.set_keyspace('ks')
 
         if return_nodes:
@@ -164,18 +182,16 @@ class UpgradeTester(Tester):
             sessions_and_meta.append((True, session))
 
         # open a second session with the node on the old version
-        session = self.patient_exclusive_cql_connection(node2, protocol_version=self.protocol_version)
+        if self.CL:
+            session = self.patient_exclusive_cql_connection(node2, protocol_version=self.protocol_version, consistency_level=self.CL, **kwargs)
+        else:
+            session = self.patient_exclusive_cql_connection(node2, protocol_version=self.protocol_version, **kwargs)
         session.set_keyspace('ks')
 
         if return_nodes:
             sessions_and_meta.append((False, session, node2))
         else:
             sessions_and_meta.append((False, session))
-
-        if self.CL:
-            for session_and_meta in sessions_and_meta:
-                session = session_and_meta[1]
-                session.default_consistency_level = self.CL
 
         # Let the nodes settle briefly before yielding connections in turn (on the upgraded and non-upgraded alike)
         # CASSANDRA-11396 was the impetus for this change, wherein some apparent perf noise was preventing
@@ -188,10 +204,10 @@ class UpgradeTester(Tester):
 
     def get_version(self):
         node1 = self.cluster.nodelist()[0]
-        return node1.version()
+        return node1.get_cassandra_version()
 
     def get_node_versions(self):
-        return [LooseVersion(n.get_cassandra_version()) for n in self.cluster.nodelist()]
+        return [n.get_cassandra_version() for n in self.cluster.nodelist()]
 
     def node_version_above(self, version):
         return min(self.get_node_versions()) >= version

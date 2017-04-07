@@ -3,9 +3,9 @@ import time
 
 from cassandra import ConsistencyLevel
 
-from dtest import DISABLE_VNODES, Tester
+from dtest import DISABLE_VNODES, Tester, create_ks
 from tools.data import create_c1c2_table, insert_c1c2, query_c1c2
-from tools.decorators import known_failure, no_vnodes, since
+from tools.decorators import no_vnodes, since
 
 
 @since('3.0')
@@ -48,7 +48,7 @@ class TestHintedHandoffConfig(Tester):
         will store hints only when hinted handoff is enabled
         """
         session = self.patient_exclusive_cql_connection(node1)
-        self.create_ks(session, 'ks', 2)
+        create_ks(session, 'ks', 2)
         create_c1c2_table(self, session)
 
         node2.stop(wait_other_notice=True)
@@ -71,10 +71,6 @@ class TestHintedHandoffConfig(Tester):
             else:
                 query_c1c2(session, n, ConsistencyLevel.ONE, tolerate_missing=True, must_be_missing=True)
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11439',
-                   flaky=False,
-                   notes='Windows')
     def nodetool_test(self):
         """
         Test various nodetool commands
@@ -125,10 +121,6 @@ class TestHintedHandoffConfig(Tester):
 
         self._do_hinted_handoff(node1, node2, True)
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11439',
-                   flaky=False,
-                   notes='Windows')
     def hintedhandoff_dc_disabled_test(self):
         """
         Test global hinted handoff enabled with the dc disabled
@@ -142,14 +134,6 @@ class TestHintedHandoffConfig(Tester):
 
         self._do_hinted_handoff(node1, node2, False)
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11902',
-                   flaky=True,
-                   notes='Fails on trunk so far, hints not being sent.')
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11439',
-                   flaky=False,
-                   notes='Windows')
     def hintedhandoff_dc_reenabled_test(self):
         """
         Test global hinted handoff enabled with the dc disabled first and then re-enabled
@@ -176,14 +160,17 @@ class TestHintedHandoff(Tester):
         self.cluster.populate(4).start(wait_for_binary_proto=True)
         [node1, node2, node3, node4] = self.cluster.nodelist()
         session = self.patient_cql_connection(node1)
-        self.create_ks(session, 'ks', 2)
+        create_ks(session, 'ks', 2)
         create_c1c2_table(self, session)
         node4.stop(wait_other_notice=True)
         insert_c1c2(session, n=100, consistency=ConsistencyLevel.ONE)
         node1.decommission()
         node4.start(wait_for_binary_proto=True)
-        node2.decommission()
-        node3.decommission()
+
+        force = True if self.cluster.version() >= '3.12' else False
+        node2.decommission(force=force)
+        node3.decommission(force=force)
+
         time.sleep(5)
         for x in xrange(0, 100):
             query_c1c2(session, x, ConsistencyLevel.ONE)

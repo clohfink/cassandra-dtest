@@ -147,7 +147,7 @@ def assert_none(session, query, cl=None):
     assert list_res == [], "Expected nothing from {}, but got {}".format(query, list_res)
 
 
-def assert_all(session, query, expected, cl=None, ignore_order=False):
+def assert_all(session, query, expected, cl=None, ignore_order=False, timeout=None):
     """
     Assert query returns all expected items optionally in the correct order
     @param session Session in use
@@ -155,13 +155,14 @@ def assert_all(session, query, expected, cl=None, ignore_order=False):
     @param expected Expected results from query
     @param cl Optional Consistency Level setting. Default ONE
     @param ignore_order Optional boolean flag determining whether response is ordered
+    @param timeout Optional query timeout, in seconds
 
     Examples:
     assert_all(session, "LIST USERS", [['aleksey', False], ['cassandra', True]])
     assert_all(self.session1, "SELECT * FROM ttl_table;", [[1, 42, 1, 1]])
     """
     simple_query = SimpleStatement(query, consistency_level=cl)
-    res = session.execute(simple_query)
+    res = session.execute(simple_query) if timeout is None else session.execute(simple_query, timeout=timeout)
     list_res = _rows_to_list(res)
     if ignore_order:
         expected = sorted(expected)
@@ -184,7 +185,7 @@ def assert_almost_equal(*args, **kwargs):
     vmax = max(args)
     vmin = min(args)
     error_message = '' if 'error_message' not in kwargs else kwargs['error_message']
-    assert vmin > vmax * (1.0 - error) or vmin == vmax, "values not within {.2f}% of the max: {} ({})".format(error * 100, args, error_message)
+    assert vmin > vmax * (1.0 - error) or vmin == vmax, "values not within {:.2f}% of the max: {} ({})".format(error * 100, args, error_message)
 
 
 def assert_row_count(session, table_name, expected, where=None):
@@ -275,9 +276,25 @@ def assert_stderr_clean(err, acceptable_errors=None):
     """
     if acceptable_errors is None:
         acceptable_errors = ["WARN.*JNA link failure.*unavailable.",
-                             "objc.*Class JavaLaunchHelper.*?Which one is undefined."]
+                             "objc.*Class JavaLaunchHelper.*?Which one is undefined.",
+                             # Stress tool JMX connection failure, see CASSANDRA-12437
+                             "Failed to connect over JMX; not collecting these stats"]
 
     regex_str = "^({}|\s*|\n)*$".format("|".join(acceptable_errors))
     match = re.search(regex_str, err)
 
     assert_true(match, "Attempted to check that stderr was empty. Instead, stderr is {}, but the regex used to check against stderr is {}".format(err, regex_str))
+
+
+def assert_bootstrap_state(tester, node, expected_bootstrap_state):
+    """
+    Assert that a node is on a given bootstrap state
+    @param tester The dtest.Tester object to fetch the exclusive connection to the node
+    @param node The node to check bootstrap state
+    @param expected_bootstrap_state Bootstrap state to expect
+
+    Examples:
+    assert_bootstrap_state(self, node3, 'COMPLETED')
+    """
+    session = tester.patient_exclusive_cql_connection(node)
+    assert_one(session, "SELECT bootstrapped FROM system.local WHERE key='local'", [expected_bootstrap_state])

@@ -3,14 +3,15 @@ from distutils.version import LooseVersion
 from cassandra import ConsistencyLevel
 from ccmlib.common import is_win
 
-from dtest import Tester, debug
+from dtest import Tester, debug, create_ks, create_cf
+from tools.assertions import assert_length_equal
 from tools.data import insert_c1c2
 from tools.decorators import since
 from tools.jmxutils import (JolokiaAgent, make_mbean,
                             remove_perf_disable_shared_mem)
 
 
-@since("2.2")
+@since("2.2", max_version="4")
 class TestDeprecatedRepairAPI(Tester):
     """
     @jira_ticket CASSANDRA-9570
@@ -139,11 +140,11 @@ class TestDeprecatedRepairAPI(Tester):
         node1, node2 = cluster.nodelist()
         remove_perf_disable_shared_mem(node1)
         cluster.start()
-        supports_pull_repair = LooseVersion(cluster.version()) >= LooseVersion('3.10')
+        supports_pull_repair = cluster.version() >= LooseVersion('3.10')
 
         session = self.patient_cql_connection(node1)
-        self.create_ks(session, 'ks', 2)
-        self.create_cf(session, 'cf', read_repair=0.0, columns={'c1': 'text', 'c2': 'text'})
+        create_ks(session, 'ks', 2)
+        create_cf(session, 'cf', read_repair=0.0, columns={'c1': 'text', 'c2': 'text'})
 
         insert_c1c2(session, n=1000, consistency=ConsistencyLevel.ALL)
 
@@ -155,11 +156,12 @@ class TestDeprecatedRepairAPI(Tester):
         # wait for log to start
         node1.watch_log_for("Starting repair command")
         # get repair parameters from the log
-        l = node1.grep_log(("Starting repair command #1, repairing keyspace ks with repair options \(parallelism: (?P<parallelism>\w+), primary range: (?P<pr>\w+), "
+        l = node1.grep_log(("Starting repair command #1" + (" \([^\)]+\)" if cluster.version() >= LooseVersion("3.10") else "") +
+                            ", repairing keyspace ks with repair options \(parallelism: (?P<parallelism>\w+), primary range: (?P<pr>\w+), "
                             "incremental: (?P<incremental>\w+), job threads: (?P<jobs>\d+), ColumnFamilies: (?P<cfs>.+), dataCenters: (?P<dc>.+), "
                             "hosts: (?P<hosts>.+), # of ranges: (?P<ranges>\d+)(, pull repair: (?P<pullrepair>true|false))?\)"))
 
-        self.assertEqual(len(l), 1)
+        assert_length_equal(l, 1)
         line, m = l[0]
 
         if supports_pull_repair:

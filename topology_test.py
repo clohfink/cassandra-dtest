@@ -1,14 +1,16 @@
 import re
 import time
 from threading import Thread
+from unittest import skip
 
 from cassandra import ConsistencyLevel
 from ccmlib.node import TimeoutError, ToolError
+from nose.plugins.attrib import attr
 
-from tools.assertions import assert_almost_equal
-from dtest import Tester, debug
+from dtest import Tester, debug, create_ks, create_cf
+from tools.assertions import assert_almost_equal, assert_all, assert_none
 from tools.data import insert_c1c2, query_c1c2
-from tools.decorators import known_failure, no_vnodes, since
+from tools.decorators import no_vnodes, since
 
 
 class TestTopology(Tester):
@@ -29,9 +31,98 @@ class TestTopology(Tester):
 
         node1.stop(gently=False)
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-12428',
-                   flaky=True)
+    def size_estimates_multidc_test(self):
+        """
+        Test that primary ranges are correctly generated on
+        system.size_estimates for multi-dc, multi-ks scenario
+        @jira_ticket CASSANDRA-9639
+        """
+        debug("Creating cluster")
+        cluster = self.cluster
+        cluster.set_configuration_options(values={'num_tokens': 2})
+        cluster.populate([2, 1])
+        node1_1, node1_2, node2_1 = cluster.nodelist()
+
+        debug("Setting tokens")
+        node1_tokens, node2_tokens, node3_tokens = ['-6639341390736545756,-2688160409776496397',
+                                                    '-2506475074448728501,8473270337963525440',
+                                                    '-3736333188524231709,8673615181726552074']
+        node1_1.set_configuration_options(values={'initial_token': node1_tokens})
+        node1_2.set_configuration_options(values={'initial_token': node2_tokens})
+        node2_1.set_configuration_options(values={'initial_token': node3_tokens})
+        cluster.set_configuration_options(values={'num_tokens': 2})
+
+        debug("Starting cluster")
+        cluster.start()
+
+        out, _, _ = node1_1.nodetool('ring')
+        debug("Nodetool ring output {}".format(out))
+
+        debug("Creating keyspaces")
+        session = self.patient_cql_connection(node1_1)
+        create_ks(session, 'ks1', 3)
+        create_ks(session, 'ks2', {'dc1': 2})
+        create_cf(session, 'ks1.cf1', columns={'c1': 'text', 'c2': 'text'})
+        create_cf(session, 'ks2.cf2', columns={'c1': 'text', 'c2': 'text'})
+
+        debug("Refreshing size estimates")
+        node1_1.nodetool('refreshsizeestimates')
+        node1_2.nodetool('refreshsizeestimates')
+        node2_1.nodetool('refreshsizeestimates')
+
+        """
+        CREATE KEYSPACE ks1 WITH replication =
+            {'class': 'SimpleStrategy', 'replication_factor': '3'}
+        CREATE KEYSPACE ks2 WITH replication =
+            {'class': 'NetworkTopologyStrategy', 'dc1': '2'}  AND durable_writes = true;
+
+        Datacenter: dc1
+        ==========
+        Address     Token
+                    8473270337963525440
+        127.0.0.1   -6639341390736545756
+        127.0.0.1   -2688160409776496397
+        127.0.0.2   -2506475074448728501
+        127.0.0.2   8473270337963525440
+
+        Datacenter: dc2
+        ==========
+        Address     Token
+                    8673615181726552074
+        127.0.0.3   -3736333188524231709
+        127.0.0.3   8673615181726552074
+        """
+
+        debug("Checking node1_1 size_estimates primary ranges")
+        session = self.patient_exclusive_cql_connection(node1_1)
+        assert_all(session, "SELECT range_start, range_end FROM system.size_estimates "
+                            "WHERE keyspace_name = 'ks1'", [['-3736333188524231709', '-2688160409776496397'],
+                                                            ['-9223372036854775808', '-6639341390736545756'],
+                                                            ['8673615181726552074', '-9223372036854775808']])
+        assert_all(session, "SELECT range_start, range_end FROM system.size_estimates "
+                            "WHERE keyspace_name = 'ks2'", [['-3736333188524231709', '-2688160409776496397'],
+                                                            ['-6639341390736545756', '-3736333188524231709'],
+                                                            ['-9223372036854775808', '-6639341390736545756'],
+                                                            ['8473270337963525440', '8673615181726552074'],
+                                                            ['8673615181726552074', '-9223372036854775808']])
+
+        debug("Checking node1_2 size_estimates primary ranges")
+        session = self.patient_exclusive_cql_connection(node1_2)
+        assert_all(session, "SELECT range_start, range_end FROM system.size_estimates "
+                            "WHERE keyspace_name = 'ks1'", [['-2506475074448728501', '8473270337963525440'],
+                                                            ['-2688160409776496397', '-2506475074448728501']])
+        assert_all(session, "SELECT range_start, range_end FROM system.size_estimates "
+                            "WHERE keyspace_name = 'ks2'", [['-2506475074448728501', '8473270337963525440'],
+                                                            ['-2688160409776496397', '-2506475074448728501']])
+
+        debug("Checking node2_1 size_estimates primary ranges")
+        session = self.patient_exclusive_cql_connection(node2_1)
+        assert_all(session, "SELECT range_start, range_end FROM system.size_estimates "
+                            "WHERE keyspace_name = 'ks1'", [['-6639341390736545756', '-3736333188524231709'],
+                                                            ['8473270337963525440', '8673615181726552074']])
+        assert_none(session, "SELECT range_start, range_end FROM system.size_estimates "
+                             "WHERE keyspace_name = 'ks2'")
+
     def simple_decommission_test(self):
         """
         @jira_ticket CASSANDRA-9912
@@ -41,6 +132,12 @@ class TestTopology(Tester):
         cluster.populate(3)
         cluster.start(wait_for_binary_proto=True, jvm_args=["-Dcassandra.size_recorder_interval=1"])
         node1, node2, node3 = cluster.nodelist()
+
+        session = self.patient_cql_connection(node1)
+
+        if cluster.version() >= '2.2':
+            # reduce system_distributed RF to 2 so we don't require forceful decommission
+            session.execute("ALTER KEYSPACE system_distributed WITH REPLICATION = {'class':'SimpleStrategy', 'replication_factor':'2'};")
 
         # write some data
         node1.stress(['write', 'n=10K', 'no-warmup', '-rate', 'threads=8'])
@@ -53,6 +150,7 @@ class TestTopology(Tester):
         # described in 9912. Do not remove it.
         time.sleep(10)
 
+    @skip('Hangs on CI for 2.1')
     def concurrent_decommission_not_allowed_test(self):
         """
         Test concurrent decommission is not allowed
@@ -63,8 +161,8 @@ class TestTopology(Tester):
         node1, node2 = cluster.nodelist()
 
         session = self.patient_cql_connection(node2)
-        self.create_ks(session, 'ks', 1)
-        self.create_cf(session, 'cf', columns={'c1': 'text', 'c2': 'text'})
+        create_ks(session, 'ks', 1)
+        create_cf(session, 'cf', columns={'c1': 'text', 'c2': 'text'})
         insert_c1c2(session, n=10000, consistency=ConsistencyLevel.ALL)
 
         mark = node2.mark_log()
@@ -105,8 +203,10 @@ class TestTopology(Tester):
         node1, node2, node3 = cluster.nodelist()
 
         session = self.patient_cql_connection(node2)
-        self.create_ks(session, 'ks', 2)
-        self.create_cf(session, 'cf', columns={'c1': 'text', 'c2': 'text'})
+        # reduce system_distributed RF to 2 so we don't require forceful decommission
+        session.execute("ALTER KEYSPACE system_distributed WITH REPLICATION = {'class':'SimpleStrategy', 'replication_factor':'2'};")
+        create_ks(session, 'ks', 2)
+        create_cf(session, 'cf', columns={'c1': 'text', 'c2': 'text'})
         insert_c1c2(session, n=10000, consistency=ConsistencyLevel.ALL)
 
         # Execute first rebuild, should fail
@@ -152,8 +252,8 @@ class TestTopology(Tester):
         node1, node2, node3 = cluster.nodelist()
 
         session = self.patient_cql_connection(node1)
-        self.create_ks(session, 'ks', 1)
-        self.create_cf(session, 'cf', columns={'c1': 'text', 'c2': 'text'})
+        create_ks(session, 'ks', 1)
+        create_cf(session, 'cf', columns={'c1': 'text', 'c2': 'text'})
 
         insert_c1c2(session, n=30000, consistency=ConsistencyLevel.ONE)
 
@@ -196,8 +296,8 @@ class TestTopology(Tester):
         node1, node2, node3, node4 = cluster.nodelist()
 
         session = self.patient_cql_connection(node1)
-        self.create_ks(session, 'ks', 2)
-        self.create_cf(session, 'cf', columns={'c1': 'text', 'c2': 'text'})
+        create_ks(session, 'ks', 2)
+        create_cf(session, 'cf', columns={'c1': 'text', 'c2': 'text'})
 
         insert_c1c2(session, n=30000, consistency=ConsistencyLevel.QUORUM)
 
@@ -233,8 +333,8 @@ class TestTopology(Tester):
         time.sleep(0.2)
 
         session = self.patient_cql_connection(node1)
-        self.create_ks(session, 'ks', 1)
-        self.create_cf(session, 'cf', columns={'c1': 'text', 'c2': 'text'})
+        create_ks(session, 'ks', 1)
+        create_cf(session, 'cf', columns={'c1': 'text', 'c2': 'text'})
 
         insert_c1c2(session, n=10000, consistency=ConsistencyLevel.ONE)
 
@@ -249,9 +349,6 @@ class TestTopology(Tester):
         for n in xrange(0, 10000):
             query_c1c2(session, n, ConsistencyLevel.ONE)
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-12260',
-                   flaky=True)
     @since('3.0')
     @no_vnodes()
     def decommissioned_node_cant_rejoin_test(self):
@@ -339,6 +436,33 @@ class TestTopology(Tester):
         time.sleep(30)
         out = self.show_status(node2)
         self.assertFalse(null_status_pattern.search(out))
+
+    @since('3.12')
+    @attr('resource-intensive')
+    def stop_decommission_too_few_replicas_multi_dc_test(self):
+        """
+        Decommission should fail when it would result in the number of live replicas being less than
+        the replication factor. --force should bypass this requirement.
+        @jira_ticket CASSANDRA-12510
+        @expected_errors ToolError when # nodes will drop below configured replicas in NTS/SimpleStrategy
+        """
+        cluster = self.cluster
+        cluster.populate([2, 2]).start(wait_for_binary_proto=True)
+        node1, node2, node3, node4 = self.cluster.nodelist()
+        session = self.patient_cql_connection(node2)
+        session.execute("ALTER KEYSPACE system_distributed WITH REPLICATION = {'class':'SimpleStrategy', 'replication_factor':'2'};")
+        create_ks(session, 'ks', {'dc1': 2, 'dc2': 2})
+        with self.assertRaises(ToolError):
+            node4.nodetool('decommission')
+
+        session.execute('DROP KEYSPACE ks')
+        create_ks(session, 'ks2', 4)
+        with self.assertRaises(ToolError):
+            node4.nodetool('decommission')
+
+        node4.nodetool('decommission --force')
+        decommissioned = node4.watch_log_for("DECOMMISSIONED", timeout=120)
+        self.assertTrue(decommissioned, "Node failed to decommission when passed --force")
 
     def show_status(self, node):
         out, _, _ = node.nodetool('status')

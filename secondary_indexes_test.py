@@ -12,15 +12,16 @@ from cassandra.protocol import ConfigurationException
 from cassandra.query import BatchStatement, SimpleStatement
 
 from dtest import (DISABLE_VNODES, OFFHEAP_MEMTABLES, DtestTimeoutError,
-                   Tester, debug, index_is_built)
-from tools.assertions import assert_invalid, assert_one, assert_row_count
-from tools.data import rows_to_list
-from tools.decorators import known_failure, since
+                   Tester, debug, CASSANDRA_VERSION_FROM_BUILD, create_ks, create_cf)
+from tools.assertions import assert_bootstrap_state, assert_invalid, assert_one, assert_row_count
+from tools.data import index_is_built, rows_to_list
+from tools.decorators import since
+from tools.misc import new_node
 
 
 class TestSecondaryIndexes(Tester):
 
-    def bug3367_test(self):
+    def data_created_before_index_not_returned_in_where_query_test(self):
         """
         @jira_ticket CASSANDRA-3367
         """
@@ -29,10 +30,10 @@ class TestSecondaryIndexes(Tester):
         [node1] = cluster.nodelist()
 
         session = self.patient_cql_connection(node1)
-        self.create_ks(session, 'ks', 1)
+        create_ks(session, 'ks', 1)
 
         columns = {"password": "varchar", "gender": "varchar", "session_token": "varchar", "state": "varchar", "birth_year": "bigint"}
-        self.create_cf(session, 'users', columns=columns)
+        create_cf(session, 'users', columns=columns)
 
         # insert data
         session.execute("INSERT INTO users (KEY, password, gender, state, birth_year) VALUES ('user1', 'ch@ngem3a', 'f', 'TX', 1968);")
@@ -136,8 +137,8 @@ class TestSecondaryIndexes(Tester):
         # to complete, to prevent schema concurrency issues with the drop
         # keyspace calls that come later. See CASSANDRA-11729.
         if self.cluster.version() > '3.0':
-            self.wait_for_any_log(self.cluster.nodelist(), 'Completed submission of build tasks for any materialized views',
-                                  timeout=35, filename='debug.log')
+            self.cluster.wait_for_any_log('Completed submission of build tasks for any materialized views',
+                                          timeout=35, filename='debug.log')
 
         # This only occurs when dropping and recreating with
         # the same name, so loop through this test a few times:
@@ -148,7 +149,7 @@ class TestSecondaryIndexes(Tester):
             except ConfigurationException:
                 pass
 
-            self.create_ks(session, 'ks', 1)
+            create_ks(session, 'ks', 1)
             session.execute("CREATE TABLE ks.cf (key text PRIMARY KEY, col1 text);")
             session.execute("CREATE INDEX on ks.cf (col1);")
 
@@ -175,7 +176,7 @@ class TestSecondaryIndexes(Tester):
         node1, node2, node3 = cluster.nodelist()
         session = self.patient_cql_connection(node1)
 
-        self.create_ks(session, 'ks', 1)
+        create_ks(session, 'ks', 1)
 
         # This only occurs when dropping and recreating with
         # the same name, so loop through this test a few times:
@@ -211,7 +212,7 @@ class TestSecondaryIndexes(Tester):
         node1 = cluster.nodelist()[0]
         session = self.patient_cql_connection(node1)
 
-        self.create_ks(session, 'ks', 1)
+        create_ks(session, 'ks', 1)
 
         self.insert_row_with_oversize_value("CREATE TABLE %s(a int, b int, c text, PRIMARY KEY (a))",
                                             "CREATE INDEX ON %s(c)",
@@ -486,9 +487,6 @@ class TestSecondaryIndexes(Tester):
 
 class TestSecondaryIndexesOnCollections(Tester):
 
-    def __init__(self, *args, **kwargs):
-        Tester.__init__(self, *args, **kwargs)
-
     def test_tuple_indexes(self):
         """
         Checks that secondary indexes on tuples work for querying
@@ -497,7 +495,7 @@ class TestSecondaryIndexesOnCollections(Tester):
         cluster.populate(1).start()
         [node1] = cluster.nodelist()
         session = self.patient_cql_connection(node1)
-        self.create_ks(session, 'tuple_index_test', 1)
+        create_ks(session, 'tuple_index_test', 1)
         session.execute("use tuple_index_test")
         session.execute("""
             CREATE TABLE simple_with_tuple (
@@ -584,7 +582,7 @@ class TestSecondaryIndexesOnCollections(Tester):
         cluster.populate(1).start()
         [node1] = cluster.nodelist()
         session = self.patient_cql_connection(node1)
-        self.create_ks(session, 'list_index_search', 1)
+        create_ks(session, 'list_index_search', 1)
 
         stmt = ("CREATE TABLE list_index_search.users ("
                 "user_id uuid PRIMARY KEY,"
@@ -674,7 +672,7 @@ class TestSecondaryIndexesOnCollections(Tester):
         cluster.populate(1).start()
         [node1] = cluster.nodelist()
         session = self.patient_cql_connection(node1)
-        self.create_ks(session, 'set_index_search', 1)
+        create_ks(session, 'set_index_search', 1)
 
         stmt = ("CREATE TABLE set_index_search.users ("
                 "user_id uuid PRIMARY KEY,"
@@ -764,7 +762,7 @@ class TestSecondaryIndexesOnCollections(Tester):
         cluster.populate(1).start()
         [node1] = cluster.nodelist()
         session = self.patient_cql_connection(node1)
-        self.create_ks(session, 'map_double_index', 1)
+        create_ks(session, 'map_double_index', 1)
         session.execute("""
                 CREATE TABLE map_tbl (
                     id uuid primary key,
@@ -806,10 +804,6 @@ class TestSecondaryIndexesOnCollections(Tester):
         session.cluster.refresh_schema_metadata()
         self.assertEqual(0, len(session.cluster.metadata.keyspaces["map_double_index"].indexes))
 
-    @known_failure(failure_source='test',
-                   jira_url='https://issues.apache.org/jira/browse/CASSANDRA-11879',
-                   flaky=True,
-                   notes='Windows')
     @skipIf(OFFHEAP_MEMTABLES, 'Hangs with offheap memtables')
     def test_map_indexes(self):
         """
@@ -819,7 +813,7 @@ class TestSecondaryIndexesOnCollections(Tester):
         cluster.populate(1).start()
         [node1] = cluster.nodelist()
         session = self.patient_cql_connection(node1)
-        self.create_ks(session, 'map_index_search', 1)
+        create_ks(session, 'map_index_search', 1)
 
         stmt = ("CREATE TABLE map_index_search.users ("
                 "user_id uuid PRIMARY KEY,"
@@ -973,7 +967,7 @@ class TestUpgradeSecondaryIndexes(Tester):
 
         [node1] = cluster.nodelist()
         session = self.patient_cql_connection(node1)
-        self.create_ks(session, 'index_upgrade', 1)
+        create_ks(session, 'index_upgrade', 1)
         session.execute("CREATE TABLE index_upgrade.table1 (k int PRIMARY KEY, v int)")
         session.execute("CREATE INDEX ON index_upgrade.table1(v)")
         session.execute("INSERT INTO index_upgrade.table1 (k,v) VALUES (0,0)")
@@ -1018,3 +1012,101 @@ class TestUpgradeSecondaryIndexes(Tester):
             node.set_log_level("INFO")
             node.start(wait_other_notice=True)
             # node.nodetool('upgradesstables -a')
+
+
+@skipIf(CASSANDRA_VERSION_FROM_BUILD == '3.9', "Test doesn't run on 3.9")
+@since('3.10')
+class TestPreJoinCallback(Tester):
+
+    def __init__(self, *args, **kwargs):
+        # Ignore these log patterns:
+        self.ignore_log_patterns = [
+            # ignore all streaming errors during bootstrap
+            r'Exception encountered during startup',
+            r'Streaming error occurred',
+            r'\[Stream.*\] Streaming error occurred',
+            r'\[Stream.*\] Remote peer 127.0.0.\d failed stream session',
+            r'Error while waiting on bootstrap to complete. Bootstrap will have to be restarted.'
+        ]
+        Tester.__init__(self, *args, **kwargs)
+
+    def _base_test(self, joinFn):
+        cluster = self.cluster
+        tokens = cluster.balanced_tokens(2)
+        cluster.set_configuration_options(values={'num_tokens': 1})
+
+        # Create a single node cluster
+        cluster.populate(1)
+        node1 = cluster.nodelist()[0]
+        node1.set_configuration_options(values={'initial_token': tokens[0]})
+        cluster.start(wait_other_notice=True)
+
+        # Create a table with 2i
+        session = self.patient_cql_connection(node1)
+        create_ks(session, 'ks', 1)
+        create_cf(session, 'cf', columns={'c1': 'text', 'c2': 'text'})
+        session.execute("CREATE INDEX c2_idx ON cf (c2);")
+
+        keys = 10000
+        insert_statement = session.prepare("INSERT INTO ks.cf (key, c1, c2) VALUES (?, 'value1', 'value2')")
+        execute_concurrent_with_args(session, insert_statement, [['k%d' % k] for k in range(keys)])
+
+        # Run the join function to test
+        joinFn(cluster, tokens[1])
+
+    def bootstrap_test(self):
+        def bootstrap(cluster, token):
+            node2 = new_node(cluster)
+            node2.set_configuration_options(values={'initial_token': token})
+            node2.start(wait_for_binary_proto=True)
+            self.assertTrue(node2.grep_log('Executing pre-join post-bootstrap tasks'))
+
+        self._base_test(bootstrap)
+
+    def resume_test(self):
+        def resume(cluster, token):
+            node1 = cluster.nodes['node1']
+            # set up byteman on node1 to inject a failure when streaming to node2
+            node1.stop(wait=True)
+            node1.byteman_port = '8100'
+            node1.import_config_files()
+            node1.start(wait_for_binary_proto=True)
+            node1.byteman_submit(['./byteman/inject_failure_streaming_to_node2.btm'])
+
+            node2 = new_node(cluster)
+            node2.set_configuration_options(values={'initial_token': token, 'streaming_socket_timeout_in_ms': 1000})
+            node2.start(wait_other_notice=False, wait_for_binary_proto=True)
+            assert_bootstrap_state(self, node2, 'IN_PROGRESS')
+
+            node2.nodetool("bootstrap resume")
+            assert_bootstrap_state(self, node2, 'COMPLETED')
+            self.assertTrue(node2.grep_log('Executing pre-join post-bootstrap tasks'))
+
+        self._base_test(resume)
+
+    def manual_join_test(self):
+        def manual_join(cluster, token):
+            node2 = new_node(cluster)
+            node2.set_configuration_options(values={'initial_token': token})
+            node2.start(join_ring=False, wait_for_binary_proto=True, wait_other_notice=240)
+            self.assertTrue(node2.grep_log('Not joining ring as requested'))
+            self.assertFalse(node2.grep_log('Executing pre-join'))
+
+            node2.nodetool("join")
+            self.assertTrue(node2.grep_log('Executing pre-join post-bootstrap tasks'))
+
+        self._base_test(manual_join)
+
+    def write_survey_test(self):
+        def write_survey_and_join(cluster, token):
+            node2 = new_node(cluster)
+            node2.set_configuration_options(values={'initial_token': token})
+            node2.start(jvm_args=["-Dcassandra.write_survey=true"], wait_for_binary_proto=True)
+            self.assertTrue(node2.grep_log('Startup complete, but write survey mode is active, not becoming an active ring member.'))
+            self.assertFalse(node2.grep_log('Executing pre-join'))
+
+            node2.nodetool("join")
+            self.assertTrue(node2.grep_log('Leaving write survey mode and joining ring at operator request'))
+            self.assertTrue(node2.grep_log('Executing pre-join post-bootstrap tasks'))
+
+        self._base_test(write_survey_and_join)

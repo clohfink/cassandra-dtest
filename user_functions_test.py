@@ -4,21 +4,19 @@ from distutils.version import LooseVersion
 
 from cassandra import FunctionFailure
 
+from dtest import CASSANDRA_VERSION_FROM_BUILD, Tester, debug, create_ks
 from tools.assertions import assert_invalid, assert_none, assert_one
-from dtest import CASSANDRA_VERSION_FROM_BUILD, Tester, debug
 from tools.decorators import since
+from tools.misc import ImmutableMapping
 
 
 @since('2.2')
 class TestUserFunctions(Tester):
-
-    def __init__(self, *args, **kwargs):
-        if CASSANDRA_VERSION_FROM_BUILD >= '3.0':
-            kwargs['cluster_options'] = {'enable_user_defined_functions': 'true',
-                                         'enable_scripted_user_defined_functions': 'true'}
-        else:
-            kwargs['cluster_options'] = {'enable_user_defined_functions': 'true'}
-        Tester.__init__(self, *args, **kwargs)
+    if CASSANDRA_VERSION_FROM_BUILD >= '3.0':
+        cluster_options = ImmutableMapping({'enable_user_defined_functions': 'true',
+                                            'enable_scripted_user_defined_functions': 'true'})
+    else:
+        cluster_options = ImmutableMapping({'enable_user_defined_functions': 'true'})
 
     def prepare(self, create_keyspace=True, nodes=1, rf=1):
         cluster = self.cluster
@@ -29,7 +27,7 @@ class TestUserFunctions(Tester):
 
         session = self.patient_cql_connection(node1)
         if create_keyspace:
-            self.create_ks(session, 'ks', rf)
+            create_ks(session, 'ks', rf)
         return session
 
     def test_migration(self):
@@ -46,7 +44,7 @@ class TestUserFunctions(Tester):
         # The latter three sessions use a whitelist policy, and then don't wait for schema agreement
         # So we create `schema_wait_session` to use for schema agreement blocking, and DDL changes
         schema_wait_session = self.patient_cql_connection(node1)
-        self.create_ks(schema_wait_session, 'ks', 1)
+        create_ks(schema_wait_session, 'ks', 1)
         schema_wait_session.cluster.control_connection.wait_for_schema_agreement()
 
         node1_session = self.patient_exclusive_cql_connection(node1, keyspace='ks')
@@ -221,7 +219,7 @@ class TestUserFunctions(Tester):
         session.execute("create type test (a text, b int);")
         session.execute("create function funk(udt test) called on null input returns int language java as 'return Integer.valueOf(udt.getInt(\"b\"));';")
 
-        if LooseVersion(self.cluster.version()) >= LooseVersion('3.6'):
+        if self.cluster.version() >= LooseVersion('3.6'):
             frozen_vals = (False, True)
         else:
             frozen_vals = (True,)
@@ -251,7 +249,7 @@ class TestUserFunctions(Tester):
         session = self.prepare()
 
         session.execute("create type udt (a text, b int);")
-        self.create_ks(session, 'user_ks', 1)
+        create_ks(session, 'user_ks', 1)
 
         # ensure we cannot use a udt from another keyspace as function argument
         assert_invalid(
@@ -276,7 +274,7 @@ class TestUserFunctions(Tester):
         session = self.prepare()
 
         session.execute("create type udt (a int);")
-        self.create_ks(session, 'user_ks', 1)
+        create_ks(session, 'user_ks', 1)
         assert_invalid(
             session,
             "create aggregate suma (ks.udt) sfunc plus stype int finalfunc stri initcond 10",
